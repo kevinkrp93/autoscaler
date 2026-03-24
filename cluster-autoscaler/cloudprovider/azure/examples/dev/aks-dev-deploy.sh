@@ -69,6 +69,27 @@ yq '(.. | select(tag == "!!str")) |= envsubst(nu)' \
     cluster-autoscaler-vmss-wi-dynamic.yaml.tpl > \
     cluster-autoscaler-vmss-wi-dynamic.yaml
 
+# create the dynamic node group config (required by the AKS fork)
+kubectl apply -f - <<SETTINGS
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoscaler-settings
+  namespace: kube-system
+data:
+  settings.json: |
+    {
+      "nodeGroups": [
+        {
+          "name": "${VMSS_NAME}",
+          "minSize": 1,
+          "maxSize": 10,
+          "scaleDownPolicy": "Delete"
+        }
+      ]
+    }
+SETTINGS
+
 # skaffold dev/run/debug
 
 exit

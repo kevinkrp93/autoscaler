@@ -27,13 +27,76 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 )
 
 const (
 	containerName = "container1"
 )
+
+func TestUpdatePriorityCalculatorUsesPerVPAThreshold(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, true)
+	threshold := 0.45
+	vpa := &vpa_types.VerticalPodAutoscaler{
+		Spec: vpa_types.VerticalPodAutoscalerSpec{
+			UpdatePolicy: &vpa_types.PodUpdatePolicy{PodUpdateThreshold: &threshold},
+		},
+	}
+	calculator := NewUpdatePriorityCalculator(vpa, nil, &test.FakeRecommendationProcessor{}, nil)
+	assert.Equal(t, threshold, calculator.config.MinChangePriority)
+}
+
+func TestUpdatePriorityCalculatorUsesGlobalThresholdWhenFeatureDisabled(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, false)
+	threshold := 0.45
+	vpa := &vpa_types.VerticalPodAutoscaler{
+		Spec: vpa_types.VerticalPodAutoscalerSpec{
+			UpdatePolicy: &vpa_types.PodUpdatePolicy{PodUpdateThreshold: &threshold},
+		},
+	}
+	calculator := NewUpdatePriorityCalculator(vpa, nil, &test.FakeRecommendationProcessor{}, nil)
+	assert.Equal(t, *defaultUpdateThreshold, calculator.config.MinChangePriority)
+}
+
+func TestProfileThresholdControlsUpdateEligibility(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, true)
+	pod := test.Pod().WithName("pod").AddContainer(test.Container().WithName(containerName).
+		WithCPURequest(resource.MustParse("4")).Get()).Get()
+	for _, tc := range []struct {
+		name        string
+		threshold   float64
+		wantUpdates int
+	}{
+		{name: "aggressive", threshold: 0.1, wantUpdates: 1},
+		{name: "conservative", threshold: 0.5},
+		{name: "zero", threshold: 0, wantUpdates: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vpa := test.VerticalPodAutoscaler().WithContainer(containerName).WithTarget("5", "").
+				WithLowerBound("1", "").WithUpperBound("6", "").Get()
+			vpa.Spec.UpdatePolicy = &vpa_types.PodUpdatePolicy{PodUpdateThreshold: &tc.threshold}
+			calculator := NewUpdatePriorityCalculator(vpa, nil, &test.FakeRecommendationProcessor{},
+				NewFakeProcessor(map[string]PodPriority{"pod": {ScaleUp: true, ResourceDiff: 0.25}}))
+			calculator.AddPod(pod, pod.Status.StartTime.Add(24*time.Hour))
+			assert.Len(t, calculator.GetSortedPods(NewDefaultPodEvictionAdmission()), tc.wantUpdates)
+		})
+	}
+}
+
+func TestProfileThresholdDefaultsAndExplicitConfig(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, true)
+	vpa := &vpa_types.VerticalPodAutoscaler{}
+	calculator := NewUpdatePriorityCalculator(vpa, nil, &test.FakeRecommendationProcessor{}, nil)
+	assert.Equal(t, *defaultUpdateThreshold, calculator.config.MinChangePriority)
+	threshold := 0.45
+	vpa.Spec.UpdatePolicy = &vpa_types.PodUpdatePolicy{PodUpdateThreshold: &threshold}
+	config := &UpdateConfig{MinChangePriority: 0.7}
+	calculator = NewUpdatePriorityCalculator(vpa, config, &test.FakeRecommendationProcessor{}, nil)
+	assert.Equal(t, config.MinChangePriority, calculator.config.MinChangePriority)
+}
 
 // TODO(bskiba): Refactor the SortPriority tests as a testcase list test.
 func TestSortPriority(t *testing.T) {

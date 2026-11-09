@@ -59,6 +59,15 @@ func NewDecayingHistogram(options HistogramOptions, halfLife time.Duration) Hist
 	}
 }
 
+// CloneDecayingHistogramWithHalfLife copies accumulated weights and the reference
+// timestamp unchanged, matching checkpoint restoration under a new half-life.
+func CloneDecayingHistogramWithHalfLife(source Histogram, halfLife time.Duration) Histogram {
+	clone := *source.(*decayingHistogram)
+	clone.bucketWeight = append([]float64(nil), clone.bucketWeight...)
+	clone.halfLife = halfLife
+	return &clone
+}
+
 func (h *decayingHistogram) Percentile(percentile float64) float64 {
 	return h.histogram.Percentile(percentile)
 }

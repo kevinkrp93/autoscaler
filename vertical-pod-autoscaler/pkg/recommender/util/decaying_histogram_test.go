@@ -30,6 +30,29 @@ var (
 	startTime = time.Unix(1234567890, 0) // Arbitrary timestamp.
 )
 
+func TestCloneDecayingHistogramWithHalfLife(t *testing.T) {
+	source := NewDecayingHistogram(testHistogramOptions, time.Hour)
+	source.AddSample(1, 3, startTime)
+	source.AddSample(4, 2, startTime.Add(time.Hour))
+	original, err := source.SaveToChekpoint()
+	assert.NoError(t, err)
+
+	clone := CloneDecayingHistogramWithHalfLife(source, 5*time.Minute)
+	copied, err := clone.SaveToChekpoint()
+	assert.NoError(t, err)
+	assert.Equal(t, original, copied, "changing decay must retain bucket weights and reference time")
+
+	restored := NewDecayingHistogram(testHistogramOptions, 5*time.Minute)
+	assert.NoError(t, restored.LoadFromCheckpoint(original))
+	timestamp := startTime.Add(2 * time.Hour)
+	clone.AddSample(2, 1, timestamp)
+	restored.AddSample(2, 1, timestamp)
+	assert.True(t, clone.Equals(restored), "live transition must match existing checkpoint restoration")
+	unchanged, err := source.SaveToChekpoint()
+	assert.NoError(t, err)
+	assert.Equal(t, original, unchanged, "the source histogram must not be mutated")
+}
+
 // Verifies that Percentile() returns 0.0 when called on an empty decaying histogram
 // for any percentile.
 func TestPercentilesEmptyDecayingHistogram(t *testing.T) {

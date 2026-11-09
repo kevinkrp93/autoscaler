@@ -198,6 +198,35 @@ func TestAggregateContainerStateLoadFromCheckpoint(t *testing.T) {
 	assert.False(t, cs.AggregateMemoryPeaks.IsEmpty())
 }
 
+func TestAggregateContainerStateLoadFromCheckpointReusesHistoryWithDifferentHalfLife(t *testing.T) {
+	checkpoint := vpa_types.VerticalPodAutoscalerCheckpointStatus{
+		Version: SupportedCheckpointVersion,
+		CPUHistogram: vpa_types.HistogramCheckpoint{
+			BucketWeights: map[int]uint32{0: 10},
+			TotalWeight:   10,
+		},
+	}
+	cs := NewAggregateContainerState()
+	err := cs.LoadFromCheckpoint(&checkpoint)
+	assert.NoError(t, err)
+	assert.Equal(t, GetAggregationsConfig().CPUHistogramDecayHalfLife, cs.CPUHistogramDecayHalfLife)
+	assert.False(t, cs.AggregateCPUUsage.IsEmpty(), "stored weights should be reused under the configured decay")
+}
+
+func TestAggregateContainerStateLoadsLegacyCheckpointWithPerVPAHalfLife(t *testing.T) {
+	checkpoint := vpa_types.VerticalPodAutoscalerCheckpointStatus{
+		Version: "v3",
+		CPUHistogram: vpa_types.HistogramCheckpoint{
+			BucketWeights: map[int]uint32{0: 10},
+			TotalWeight:   10,
+		},
+	}
+	cs := NewAggregateContainerStateWithCPUHistogramDecayHalfLife(time.Minute)
+	err := cs.LoadFromCheckpoint(&checkpoint)
+	assert.NoError(t, err)
+	assert.False(t, cs.AggregateCPUUsage.IsEmpty())
+}
+
 func TestAggregateContainerStateIsExpired(t *testing.T) {
 	cs := NewAggregateContainerState()
 	cs.LastSampleStart = testTimestamp

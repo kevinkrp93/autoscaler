@@ -29,6 +29,7 @@ import (
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -71,7 +72,13 @@ func NewUpdatePriorityCalculator(vpa *vpa_types.VerticalPodAutoscaler,
 	recommendationProcessor vpa_api_util.RecommendationProcessor,
 	priorityProcessor PriorityProcessor) UpdatePriorityCalculator {
 	if config == nil {
-		config = &UpdateConfig{MinChangePriority: *defaultUpdateThreshold}
+		threshold := *defaultUpdateThreshold
+		if vpa != nil && vpa.Spec.UpdatePolicy != nil &&
+			vpa.Spec.UpdatePolicy.PodUpdateThreshold != nil &&
+			features.Enabled(features.PerVPAConfig) {
+			threshold = *vpa.Spec.UpdatePolicy.PodUpdateThreshold
+		}
+		config = &UpdateConfig{MinChangePriority: threshold}
 	}
 	return UpdatePriorityCalculator{
 		vpa:                     vpa,

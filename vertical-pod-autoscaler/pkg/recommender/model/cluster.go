@@ -28,6 +28,7 @@ import (
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	vpa_utils "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -101,6 +102,9 @@ type AggregateStateKey interface {
 	Namespace() string
 	ContainerName() string
 	Labels() labels.Labels
+	LabelSetKey() string
+	CPUHistogramDecayHalfLife() time.Duration
+	OwnerVpaID() VpaID
 }
 
 // String representation of the labels.LabelSet. This is the value returned by
@@ -169,7 +173,8 @@ func (cluster *clusterState) AddOrUpdatePod(podID PodID, newLabels labels.Set, p
 		// Set the links between the containers and aggregations based on the current pod labels.
 		for containerName, container := range pod.Containers {
 			containerID := ContainerID{PodID: podID, ContainerName: containerName}
-			container.aggregator = cluster.findOrCreateAggregateContainerState(containerID)
+			cluster.findOrCreateAggregateContainerState(containerID)
+			container.aggregator = NewContainerStateAggregatorProxy(cluster, containerID)
 		}
 
 		cluster.addPodToItsVpa(pod)
@@ -300,10 +305,50 @@ func (cluster *clusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 	if !vpaExists {
 		vpa = NewVpa(vpaID, selector, apiObject.CreationTimestamp.Time)
 		cluster.vpas[vpaID] = vpa
-		for aggregationKey, aggregation := range cluster.aggregateStateMap {
-			vpa.UseAggregationIfMatching(aggregationKey, aggregation)
-		}
+		vpa.SetResourcePolicy(apiObject.Spec.ResourcePolicy)
+		vpa.SetUpdateMode(apiObject.Spec.UpdatePolicy)
+		cluster.linkVpaToExistingAggregations(vpa)
 		vpa.PodCount = len(cluster.GetMatchingPods(vpa))
+	} else if changedContainers := vpa.changedCPUHistogramDecayContainers(apiObject.Spec.ResourcePolicy); len(changedContainers) > 0 {
+		oldAggregations := make(aggregateContainerStatesMap)
+		oldCheckpoints := make(ContainerNameToAggregateStateMap)
+		for aggregationKey, aggregation := range vpa.aggregateContainerStates {
+			if _, changed := changedContainers[aggregationKey.ContainerName()]; changed {
+				oldAggregations[aggregationKey] = aggregation
+				delete(vpa.aggregateContainerStates, aggregationKey)
+			}
+		}
+		for containerName := range changedContainers {
+			if checkpoint, exists := vpa.ContainersInitialAggregateState[containerName]; exists {
+				oldCheckpoints[containerName] = checkpoint
+				delete(vpa.ContainersInitialAggregateState, containerName)
+			}
+		}
+		vpa.SetResourcePolicy(apiObject.Spec.ResourcePolicy)
+		for containerName, checkpoint := range oldCheckpoints {
+			halfLife := vpa.CPUHistogramDecayHalfLife(containerName)
+			vpa.ContainersInitialAggregateState[containerName] = checkpoint.CloneWithCPUHistogramDecayHalfLife(halfLife)
+		}
+		for aggregationKey, aggregation := range oldAggregations {
+			oldKey, ok := aggregationKey.(aggregateStateKey)
+			if !ok {
+				return fmt.Errorf("unexpected aggregate state key type %T", aggregationKey)
+			}
+			newKey := oldKey
+			newKey.cpuHalfLife = vpa.CPUHistogramDecayHalfLife(oldKey.containerName)
+			newAggregation := aggregation.CloneWithCPUHistogramDecayHalfLife(newKey.cpuHalfLife)
+			cluster.aggregateStateMap[newKey] = newAggregation
+			vpa.UseAggregationIfMatching(newKey, newAggregation)
+		}
+		for key, aggregation := range oldAggregations {
+			if !cluster.isAggregationUsed(key) {
+				aggregation.MarkNotAutoscaled()
+				delete(cluster.aggregateStateMap, key)
+			}
+		}
+	} else {
+		vpa.SetResourcePolicy(apiObject.Spec.ResourcePolicy)
+		vpa.SetUpdateMode(apiObject.Spec.UpdatePolicy)
 	}
 	vpa.TargetRef = apiObject.Spec.TargetRef
 	vpa.Annotations = annotationsMap
@@ -315,16 +360,54 @@ func (cluster *clusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 	return nil
 }
 
+func (cluster *clusterState) isAggregationUsed(key AggregateStateKey) bool {
+	for _, vpa := range cluster.vpas {
+		if vpa.usesExactAggregation(key) {
+			return true
+		}
+	}
+	return false
+}
+
+func (cluster *clusterState) linkVpaToExistingAggregations(vpa *Vpa) {
+	pending := make(aggregateContainerStatesMap)
+	for key, aggregation := range cluster.aggregateStateMap {
+		if vpa.matchesAggregation(key) {
+			vpa.UseAggregationIfMatching(key, aggregation)
+			continue
+		}
+		if !features.Enabled(features.PerVPAConfig) || key.OwnerVpaID() != (VpaID{}) ||
+			!vpa.matchesLabels(key.Namespace(), key.ContainerName(), key.Labels()) {
+			continue
+		}
+		newKey := key.(aggregateStateKey)
+		newKey.cpuHalfLife = vpa.CPUHistogramDecayHalfLife(key.ContainerName())
+		newKey.ownerVpaID = vpa.ID
+		if _, exists := cluster.aggregateStateMap[newKey]; !exists {
+			pending[newKey] = aggregation.CloneWithCPUHistogramDecayHalfLife(newKey.cpuHalfLife)
+		}
+	}
+	for newKey, newAggregation := range pending {
+		cluster.aggregateStateMap[newKey] = newAggregation
+		vpa.UseAggregationIfMatching(newKey, newAggregation)
+	}
+}
+
 // DeleteVpa removes a VPA with the given ID from the clusterState.
 func (cluster *clusterState) DeleteVpa(vpaID VpaID) error {
 	vpa, vpaExists := cluster.vpas[vpaID]
 	if !vpaExists {
 		return NewKeyError(vpaID)
 	}
-	for _, state := range vpa.aggregateContainerStates {
-		state.MarkNotAutoscaled()
-	}
 	delete(cluster.vpas, vpaID)
+	for key, state := range vpa.aggregateContainerStates {
+		if !cluster.isAggregationUsed(key) {
+			state.MarkNotAutoscaled()
+			if key.OwnerVpaID() == vpaID {
+				delete(cluster.aggregateStateMap, key)
+			}
+		}
+	}
 	cluster.mutex.Lock()
 	defer cluster.mutex.Unlock()
 	delete(cluster.emptyVPAs, vpaID)
@@ -365,12 +448,27 @@ func (cluster *clusterState) getLabelSetKey(labelSet labels.Set) labelSetKey {
 // MakeAggregateStateKey returns the AggregateStateKey that should be used
 // to aggregate usage samples from a container with the given name in a given pod.
 func (cluster *clusterState) MakeAggregateStateKey(pod *PodState, containerName string) AggregateStateKey {
+	return cluster.makeAggregateStateKey(pod, containerName, GetAggregationsConfig().CPUHistogramDecayHalfLife)
+}
+
+func (cluster *clusterState) makeAggregateStateKey(pod *PodState, containerName string, cpuHalfLife time.Duration) aggregateStateKey {
 	return aggregateStateKey{
 		namespace:     pod.ID.Namespace,
 		containerName: containerName,
 		labelSetKey:   pod.labelSetKey,
 		labelSetMap:   &cluster.labelSetMap,
+		cpuHalfLife:   cpuHalfLife,
 	}
+}
+
+func (cluster *clusterState) aggregateStateKeyForVpa(pod *PodState, containerName string, vpa *Vpa) aggregateStateKey {
+	key := cluster.makeAggregateStateKey(pod, containerName, vpa.CPUHistogramDecayHalfLife(containerName))
+	if features.Enabled(features.PerVPAConfig) {
+		// Isolate mutable history so A -> B -> A never substitutes another
+		// VPA's weights or resurrects an old copy of this VPA's histogram.
+		key.ownerVpaID = vpa.ID
+	}
+	return key
 }
 
 // aggregateStateKeyForContainerID returns the AggregateStateKey for the ContainerID.
@@ -387,17 +485,65 @@ func (cluster *clusterState) aggregateStateKeyForContainerID(containerID Contain
 // that should be used to aggregate usage samples from container with a given ID.
 // The pod with the corresponding PodID must already be present in the clusterState.
 func (cluster *clusterState) findOrCreateAggregateContainerState(containerID ContainerID) *AggregateContainerState {
-	aggregateStateKey := cluster.aggregateStateKeyForContainerID(containerID)
-	aggregateContainerState, aggregateStateExists := cluster.aggregateStateMap[aggregateStateKey]
+	return cluster.findOrCreateAggregateContainerStateWithHalfLife(containerID, GetAggregationsConfig().CPUHistogramDecayHalfLife)
+}
+
+func (cluster *clusterState) findOrCreateAggregateContainerStateWithHalfLife(containerID ContainerID, cpuHalfLife time.Duration) *AggregateContainerState {
+	pod, podExists := cluster.pods[containerID.PodID]
+	if !podExists {
+		panic(fmt.Sprintf("Pod not present in the ClusterState: %s/%s", containerID.Namespace, containerID.PodName))
+	}
+	return cluster.findOrCreateAggregation(cluster.makeAggregateStateKey(pod, containerID.ContainerName, cpuHalfLife))
+}
+
+func (cluster *clusterState) findOrCreateAggregation(key aggregateStateKey) *AggregateContainerState {
+	aggregateContainerState, aggregateStateExists := cluster.aggregateStateMap[key]
 	if !aggregateStateExists {
-		aggregateContainerState = NewAggregateContainerState()
-		cluster.aggregateStateMap[aggregateStateKey] = aggregateContainerState
+		aggregateContainerState = NewAggregateContainerStateWithCPUHistogramDecayHalfLife(key.cpuHalfLife)
+		cluster.aggregateStateMap[key] = aggregateContainerState
 		// Link the new aggregation to the existing VPAs.
 		for _, vpa := range cluster.vpas {
-			vpa.UseAggregationIfMatching(aggregateStateKey, aggregateContainerState)
+			vpa.UseAggregationIfMatching(key, aggregateContainerState)
 		}
 	}
 	return aggregateContainerState
+}
+
+func (cluster *clusterState) findOrCreateAggregateContainerStateForContainer(containerID ContainerID) *AggregateContainerState {
+	pod := cluster.pods[containerID.PodID]
+	if pod == nil {
+		return cluster.findOrCreateAggregateContainerState(containerID)
+	}
+	podLabels := cluster.labelSetMap[pod.labelSetKey]
+	for _, vpa := range cluster.vpas {
+		if vpa.matchesLabels(containerID.Namespace, containerID.ContainerName, podLabels) {
+			return cluster.findOrCreateAggregation(cluster.aggregateStateKeyForVpa(pod, containerID.ContainerName, vpa))
+		}
+	}
+	return cluster.findOrCreateAggregateContainerState(containerID)
+}
+
+func (cluster *clusterState) addSampleToAggregations(containerID ContainerID, sample *ContainerUsageSample, subtract bool) {
+	pod := cluster.pods[containerID.PodID]
+	if pod == nil {
+		return
+	}
+	podLabels := cluster.labelSetMap[pod.labelSetKey]
+	keys := make(map[aggregateStateKey]struct{})
+	keys[cluster.makeAggregateStateKey(pod, containerID.ContainerName, GetAggregationsConfig().CPUHistogramDecayHalfLife)] = struct{}{}
+	for _, vpa := range cluster.vpas {
+		if vpa.matchesLabels(containerID.Namespace, containerID.ContainerName, podLabels) {
+			keys[cluster.aggregateStateKeyForVpa(pod, containerID.ContainerName, vpa)] = struct{}{}
+		}
+	}
+	for key := range keys {
+		aggregation := cluster.findOrCreateAggregation(key)
+		if subtract {
+			aggregation.SubtractSample(sample)
+		} else {
+			aggregation.AddSample(sample)
+		}
+	}
 }
 
 // garbageCollectAggregateCollectionStates removes obsolete AggregateCollectionStates from the clusterState.
@@ -462,6 +608,12 @@ func (cluster *clusterState) getContributiveAggregateStateKeys(ctx context.Conte
 		if podActive || podControllerExists {
 			for container := range pod.Containers {
 				contributiveKeys[cluster.MakeAggregateStateKey(pod, container)] = true
+				for _, vpa := range cluster.vpas {
+					if vpa.matchesLabels(pod.ID.Namespace, container, cluster.labelSetMap[pod.labelSetKey]) {
+						key := cluster.aggregateStateKeyForVpa(pod, container, vpa)
+						contributiveKeys[key] = true
+					}
+				}
 			}
 		}
 	}
@@ -540,6 +692,8 @@ type aggregateStateKey struct {
 	namespace     string
 	containerName string
 	labelSetKey   labelSetKey
+	cpuHalfLife   time.Duration
+	ownerVpaID    VpaID
 	// Pointer to the global map from labelSetKey to labels.Set.
 	// Note: a pointer is used so that two copies of the same key are equal.
 	labelSetMap *labelSetMap
@@ -553,6 +707,18 @@ func (k aggregateStateKey) Namespace() string {
 // ContainerName returns the name of the container for the aggregateStateKey.
 func (k aggregateStateKey) ContainerName() string {
 	return k.containerName
+}
+
+func (k aggregateStateKey) LabelSetKey() string {
+	return string(k.labelSetKey)
+}
+
+func (k aggregateStateKey) CPUHistogramDecayHalfLife() time.Duration {
+	return k.cpuHalfLife
+}
+
+func (k aggregateStateKey) OwnerVpaID() VpaID {
+	return k.ownerVpaID
 }
 
 // Labels returns the set of labels for the aggregateStateKey.

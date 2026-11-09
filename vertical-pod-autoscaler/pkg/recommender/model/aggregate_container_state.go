@@ -21,8 +21,9 @@ limitations under the License.
 // AggregateStateKey and stored in structures such as histograms of CPU and
 // memory usage, that are parts of the AggregateContainerState.
 //
-// The AggregateStateKey consists of the container name, the namespace and the
-// set of labels on the pod the container belongs to. In other words, whenever
+// The AggregateStateKey consists of the container name, the namespace, CPU
+// half-life and set of labels on the pod the container belongs to. With
+// PerVPAConfig enabled it also includes the VPA identity. In other words, whenever
 // two samples come from containers with the same name, in the same namespace
 // and with the same pod labels, they end up in the same histogram.
 //
@@ -103,10 +104,11 @@ type AggregateContainerState struct {
 	// each container should add one peak per memory aggregation interval (e.g. once every 24h).
 	AggregateMemoryPeaks util.Histogram
 	// Note: first/last sample timestamps as well as the sample count are based only on CPU samples.
-	FirstSampleStart  time.Time
-	LastSampleStart   time.Time
-	TotalSamplesCount int
-	CreationTime      time.Time
+	FirstSampleStart          time.Time
+	LastSampleStart           time.Time
+	TotalSamplesCount         int
+	CreationTime              time.Time
+	CPUHistogramDecayHalfLife time.Duration
 
 	// Following fields are needed to correctly report quality metrics
 	// for VPA. When we record a new sample in an AggregateContainerState
@@ -186,6 +188,9 @@ func (a *AggregateContainerState) MarkNotAutoscaled() {
 
 // MergeContainerState merges two AggregateContainerStates.
 func (a *AggregateContainerState) MergeContainerState(other *AggregateContainerState) {
+	if a.CPUHistogramDecayHalfLife != other.CPUHistogramDecayHalfLife {
+		panic("can't merge aggregate container states with different CPU histogram decay half-lives")
+	}
 	a.AggregateCPUUsage.Merge(other.AggregateCPUUsage)
 	a.AggregateMemoryPeaks.Merge(other.AggregateMemoryPeaks)
 
@@ -201,13 +206,20 @@ func (a *AggregateContainerState) MergeContainerState(other *AggregateContainerS
 
 // NewAggregateContainerState returns a new, empty AggregateContainerState.
 func NewAggregateContainerState() *AggregateContainerState {
+	return NewAggregateContainerStateWithCPUHistogramDecayHalfLife(GetAggregationsConfig().CPUHistogramDecayHalfLife)
+}
+
+// NewAggregateContainerStateWithCPUHistogramDecayHalfLife creates an aggregate
+// using the supplied CPU decay while retaining the configured memory decay.
+func NewAggregateContainerStateWithCPUHistogramDecayHalfLife(cpuHalfLife time.Duration) *AggregateContainerState {
 	config := GetAggregationsConfig()
 	return &AggregateContainerState{
-		AggregateCPUUsage:    util.NewDecayingHistogram(config.CPUHistogramOptions, config.CPUHistogramDecayHalfLife),
-		AggregateMemoryPeaks: util.NewDecayingHistogram(config.MemoryHistogramOptions, config.MemoryHistogramDecayHalfLife),
-		CreationTime:         time.Now(),
-		OOMBumpUpRatio:       config.OOMBumpUpRatio,
-		OOMMinBumpUp:         config.OOMMinBumpUp,
+		AggregateCPUUsage:         util.NewDecayingHistogram(config.CPUHistogramOptions, cpuHalfLife),
+		AggregateMemoryPeaks:      util.NewDecayingHistogram(config.MemoryHistogramOptions, config.MemoryHistogramDecayHalfLife),
+		CreationTime:              time.Now(),
+		CPUHistogramDecayHalfLife: cpuHalfLife,
+		OOMBumpUpRatio:            config.OOMBumpUpRatio,
+		OOMMinBumpUp:              config.OOMMinBumpUp,
 	}
 }
 
@@ -270,6 +282,32 @@ func (a *AggregateContainerState) SaveToCheckpoint() (*vpa_types.VerticalPodAuto
 		CPUHistogram:      *cpu,
 		Version:           SupportedCheckpointVersion,
 	}, nil
+}
+
+// CloneWithCPUHistogramDecayHalfLife preserves the accumulated histogram
+// weights while applying a new decay rate to future samples.
+func (a *AggregateContainerState) CloneWithCPUHistogramDecayHalfLife(halfLife time.Duration) *AggregateContainerState {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+	clone := NewAggregateContainerStateWithCPUHistogramDecayHalfLife(halfLife)
+	clone.AggregateCPUUsage = util.CloneDecayingHistogramWithHalfLife(a.AggregateCPUUsage, halfLife)
+	clone.AggregateMemoryPeaks = util.CloneDecayingHistogramWithHalfLife(
+		a.AggregateMemoryPeaks, GetAggregationsConfig().MemoryHistogramDecayHalfLife)
+	clone.FirstSampleStart = a.FirstSampleStart
+	clone.LastSampleStart = a.LastSampleStart
+	clone.TotalSamplesCount = a.TotalSamplesCount
+	clone.CreationTime = a.CreationTime
+	clone.lastRecommendation = a.lastRecommendation.DeepCopy()
+	clone.IsUnderVPA = a.IsUnderVPA
+	clone.UpdateMode = a.UpdateMode
+	clone.ScalingMode = a.ScalingMode
+	clone.OOMBumpUpRatio = a.OOMBumpUpRatio
+	clone.OOMMinBumpUp = a.OOMMinBumpUp
+	if a.ControlledResources != nil {
+		resources := append([]ResourceName(nil), (*a.ControlledResources)...)
+		clone.ControlledResources = &resources
+	}
+	return clone
 }
 
 // LoadFromCheckpoint deserializes data from VerticalPodAutoscalerCheckpointStatus
@@ -353,7 +391,7 @@ func AggregateStateByContainerName(aggregateContainerStateMap aggregateContainer
 		containerName := aggregationKey.ContainerName()
 		aggregateContainerState, isInitialized := containerNameToAggregateStateMap[containerName]
 		if !isInitialized {
-			aggregateContainerState = NewAggregateContainerState()
+			aggregateContainerState = NewAggregateContainerStateWithCPUHistogramDecayHalfLife(aggregation.CPUHistogramDecayHalfLife)
 			containerNameToAggregateStateMap[containerName] = aggregateContainerState
 		}
 		aggregateContainerState.MergeContainerState(aggregation)
@@ -377,50 +415,48 @@ func NewContainerStateAggregatorProxy(cluster *clusterState, containerID Contain
 
 // AddSample adds a container sample to the aggregator.
 func (p *ContainerStateAggregatorProxy) AddSample(sample *ContainerUsageSample) {
-	aggregator := p.cluster.findOrCreateAggregateContainerState(p.containerID)
-	aggregator.AddSample(sample)
+	p.cluster.addSampleToAggregations(p.containerID, sample, false)
 }
 
 // SubtractSample subtracts a container sample from the aggregator.
 func (p *ContainerStateAggregatorProxy) SubtractSample(sample *ContainerUsageSample) {
-	aggregator := p.cluster.findOrCreateAggregateContainerState(p.containerID)
-	aggregator.SubtractSample(sample)
+	p.cluster.addSampleToAggregations(p.containerID, sample, true)
 }
 
 // GetLastRecommendation returns last recorded recommendation.
 func (p *ContainerStateAggregatorProxy) GetLastRecommendation() corev1.ResourceList {
-	aggregator := p.cluster.findOrCreateAggregateContainerState(p.containerID)
+	aggregator := p.cluster.findOrCreateAggregateContainerStateForContainer(p.containerID)
 	return aggregator.GetLastRecommendation()
 }
 
 // NeedsRecommendation returns true if the aggregator should have recommendation calculated.
 func (p *ContainerStateAggregatorProxy) NeedsRecommendation() bool {
-	aggregator := p.cluster.findOrCreateAggregateContainerState(p.containerID)
+	aggregator := p.cluster.findOrCreateAggregateContainerStateForContainer(p.containerID)
 	return aggregator.NeedsRecommendation()
 }
 
 // GetUpdateMode returns update mode of VPA controlling the aggregator.
 func (p *ContainerStateAggregatorProxy) GetUpdateMode() *vpa_types.UpdateMode {
-	aggregator := p.cluster.findOrCreateAggregateContainerState(p.containerID)
+	aggregator := p.cluster.findOrCreateAggregateContainerStateForContainer(p.containerID)
 	return aggregator.GetUpdateMode()
 }
 
 // GetScalingMode returns scaling mode of container represented by the aggregator.
 func (p *ContainerStateAggregatorProxy) GetScalingMode() *vpa_types.ContainerScalingMode {
-	aggregator := p.cluster.findOrCreateAggregateContainerState(p.containerID)
+	aggregator := p.cluster.findOrCreateAggregateContainerStateForContainer(p.containerID)
 	return aggregator.GetScalingMode()
 }
 
 // GetOOMMinBumpUp returns the minimum amount to bump up resources when OOM is detected.
 // This implementation returns 0 to satisfy the interface requirement.
 func (p *ContainerStateAggregatorProxy) GetOOMMinBumpUp() float64 {
-	aggregator := p.cluster.findOrCreateAggregateContainerState(p.containerID)
+	aggregator := p.cluster.findOrCreateAggregateContainerStateForContainer(p.containerID)
 	return aggregator.GetOOMMinBumpUp()
 }
 
 // GetOOMBumpUpRatio returns the ratio to increase resources when OOM is detected.
 // This implementation returns 0 to satisfy the interface requirement.
 func (p *ContainerStateAggregatorProxy) GetOOMBumpUpRatio() float64 {
-	aggregator := p.cluster.findOrCreateAggregateContainerState(p.containerID)
+	aggregator := p.cluster.findOrCreateAggregateContainerStateForContainer(p.containerID)
 	return aggregator.GetOOMBumpUpRatio()
 }

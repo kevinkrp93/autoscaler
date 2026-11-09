@@ -343,6 +343,12 @@ spec:
                           - RequestsAndLimits
                           - RequestsOnly
                           type: string
+                        cpuHistogramDecayHalfLife:
+                          description: |-
+                            cpuHistogramDecayHalfLife is the time it takes a historical CPU usage
+                            sample to lose half of its weight. It overrides the recommender's
+                            --cpu-histogram-decay-half-life flag for this container.
+                          type: string
                         maxAllowed:
                           additionalProperties:
                             anyOf:
@@ -466,6 +472,13 @@ spec:
                       allowed. Overrides global '--min-replicas' flag.
                     format: int32
                     type: integer
+                  podUpdateThreshold:
+                    description: |-
+                      podUpdateThreshold is the minimum resource difference that triggers an
+                      update for pods whose requests are within the recommended range. It
+                      overrides the updater's --pod-update-threshold flag.
+                    minimum: 0
+                    type: number
                   updateMode:
                     description: |-
                       Controls when autoscaler applies changes to the pod resources.

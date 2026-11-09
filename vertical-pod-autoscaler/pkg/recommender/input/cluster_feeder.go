@@ -257,7 +257,8 @@ func (feeder *clusterStateFeeder) setVpaCheckpoint(checkpoint *vpa_types.Vertica
 		return fmt.Errorf("cannot load checkpoint to missing VPA object %s/%s", vpaID.Namespace, vpaID.VpaName)
 	}
 
-	cs := model.NewAggregateContainerState()
+	cs := model.NewAggregateContainerStateWithCPUHistogramDecayHalfLife(
+		vpa.CPUHistogramDecayHalfLife(checkpoint.Spec.ContainerName))
 	err := cs.LoadFromCheckpoint(&checkpoint.Status)
 	if err != nil {
 		return fmt.Errorf("cannot load checkpoint for VPA %s/%s. Reason: %v", vpaID.Namespace, vpaID.VpaName, err)

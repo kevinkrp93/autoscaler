@@ -149,6 +149,13 @@ type PodUpdatePolicy struct {
 	// EvictionRequirement is specified, all of them need to be fulfilled to allow eviction.
 	// +optional
 	EvictionRequirements []*EvictionRequirement `json:"evictionRequirements,omitempty" protobuf:"bytes,3,opt,name=evictionRequirements"`
+
+	// podUpdateThreshold is the minimum resource difference that triggers an
+	// update for pods whose requests are within the recommended range. It
+	// overrides the updater's --pod-update-threshold flag.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	PodUpdateThreshold *float64 `json:"podUpdateThreshold,omitempty" protobuf:"fixed64,4,opt,name=podUpdateThreshold"`
 }
 
 // UpdateMode controls when autoscaler applies changes to the pod resources.
@@ -234,6 +241,12 @@ type ContainerResourcePolicy struct {
 	// oomMinBumpUp is the minimum increase in memory when OOM is detected.
 	// +optional
 	OOMMinBumpUp *resource.Quantity `json:"oomMinBumpUp,omitempty" protobuf:"bytes,8,opt,name=oomMinBumpUp"`
+
+	// cpuHistogramDecayHalfLife is the time it takes a historical CPU usage
+	// sample to lose half of its weight. It overrides the recommender's
+	// --cpu-histogram-decay-half-life flag for this container.
+	// +optional
+	CPUHistogramDecayHalfLife *metav1.Duration `json:"cpuHistogramDecayHalfLife,omitempty" protobuf:"bytes,9,opt,name=cpuHistogramDecayHalfLife"`
 }
 
 const (

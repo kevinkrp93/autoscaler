@@ -50,6 +50,7 @@ _Appears in:_
 | `controlledValues` _[ContainerControlledValues](#containercontrolledvalues)_ | Specifies which resource values should be controlled.<br />The default is "RequestsAndLimits". |  | Enum: [RequestsAndLimits RequestsOnly] <br />Optional: \{\} <br /> |
 | `oomBumpUpRatio` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#quantity-resource-api)_ | oomBumpUpRatio is the ratio to increase memory when OOM is detected. |  | Optional: \{\} <br /> |
 | `oomMinBumpUp` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#quantity-resource-api)_ | oomMinBumpUp is the minimum increase in memory when OOM is detected. |  | Optional: \{\} <br /> |
+| `cpuHistogramDecayHalfLife` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#duration-v1-meta)_ | cpuHistogramDecayHalfLife is the time it takes a historical CPU usage<br />sample to lose half of its weight. It overrides the recommender's<br />--cpu-histogram-decay-half-life flag for this container. |  | Optional: \{\} <br /> |
 
 
 #### ContainerScalingMode
@@ -160,6 +161,7 @@ _Appears in:_
 | `updateMode` _[UpdateMode](#updatemode)_ | Controls when autoscaler applies changes to the pod resources.<br />The default is 'Recreate'. |  | Enum: [Off Initial Recreate InPlaceOrRecreate Auto] <br />Optional: \{\} <br /> |
 | `minReplicas` _integer_ | Minimal number of replicas which need to be alive for Updater to attempt<br />pod eviction (pending other checks like PDB). Only positive values are<br />allowed. Overrides global '--min-replicas' flag. |  | Optional: \{\} <br /> |
 | `evictionRequirements` _[EvictionRequirement](#evictionrequirement) array_ | EvictionRequirements is a list of EvictionRequirements that need to<br />evaluate to true in order for a Pod to be evicted. If more than one<br />EvictionRequirement is specified, all of them need to be fulfilled to allow eviction. |  | Optional: \{\} <br /> |
+| `podUpdateThreshold` _float_ | podUpdateThreshold is the minimum resource difference that triggers an<br />update for pods whose requests are within the recommended range. It<br />overrides the updater's --pod-update-threshold flag. |  | Minimum: 0 <br />Optional: \{\} <br /> |
 
 
 #### RecommendedContainerResources

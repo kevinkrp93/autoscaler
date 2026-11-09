@@ -123,6 +123,14 @@ func ValidateVPA(vpa *vpa_types.VerticalPodAutoscaler, isCreate bool) error {
 		if minReplicas := vpa.Spec.UpdatePolicy.MinReplicas; minReplicas != nil && *minReplicas <= 0 {
 			return fmt.Errorf("minReplicas has to be positive, got %v", *minReplicas)
 		}
+		if threshold := vpa.Spec.UpdatePolicy.PodUpdateThreshold; threshold != nil {
+			if !features.Enabled(features.PerVPAConfig) {
+				return fmt.Errorf("podUpdateThreshold is not supported when feature flag %s is disabled", features.PerVPAConfig)
+			}
+			if *threshold < 0 {
+				return fmt.Errorf("podUpdateThreshold must be greater than or equal to 0, got %v", *threshold)
+			}
+		}
 	}
 
 	if vpa.Spec.ResourcePolicy != nil {
@@ -150,6 +158,10 @@ func ValidateVPA(vpa *vpa_types.VerticalPodAutoscaler, isCreate bool) error {
 				if minBump < 0 {
 					return fmt.Errorf("oomMinBumpUp must be greater than or equal to 0, got %v bytes", minBump)
 				}
+			}
+
+			if halfLife := policy.CPUHistogramDecayHalfLife; halfLife != nil && halfLife.Duration <= 0 {
+				return fmt.Errorf("cpuHistogramDecayHalfLife must be positive, got %v", halfLife.Duration)
 			}
 
 			mode := policy.Mode
@@ -219,9 +231,9 @@ func validateMemoryResolution(val apires.Quantity) error {
 
 func validatePerVPAFeatureFlag(policy *vpa_types.ContainerResourcePolicy) error {
 	featureFlagOn := features.Enabled(features.PerVPAConfig)
-	perVPA := policy.OOMBumpUpRatio != nil || policy.OOMMinBumpUp != nil
+	perVPA := policy.OOMBumpUpRatio != nil || policy.OOMMinBumpUp != nil || policy.CPUHistogramDecayHalfLife != nil
 	if !featureFlagOn && perVPA {
-		return fmt.Errorf("OOMBumpUpRatio and OOMMinBumpUp are not supported when feature flag %s is disabled", features.PerVPAConfig)
+		return fmt.Errorf("per-VPA container configuration is not supported when feature flag %s is disabled", features.PerVPAConfig)
 	}
 	return nil
 }

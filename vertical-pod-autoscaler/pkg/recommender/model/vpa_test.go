@@ -17,21 +17,53 @@ limitations under the License.
 package model
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
 )
 
 var (
 	anyTime = time.Unix(0, 0)
 )
+
+func TestCPUHistogramDecayPolicyResolution(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("featureEnabled=%t", enabled), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, enabled)
+			vpa := NewVpa(VpaID{}, nil, anyTime)
+			vpa.SetResourcePolicy(&vpa_types.PodResourcePolicy{
+				ContainerPolicies: []vpa_types.ContainerResourcePolicy{
+					{ContainerName: "*", CPUHistogramDecayHalfLife: &metav1.Duration{Duration: time.Hour}},
+					{ContainerName: "app", CPUHistogramDecayHalfLife: &metav1.Duration{Duration: 5 * time.Minute}},
+					{ContainerName: "sidecar"},
+				},
+			})
+			if enabled {
+				assert.Equal(t, 5*time.Minute, vpa.CPUHistogramDecayHalfLife("app"))
+				assert.Equal(t, time.Hour, vpa.CPUHistogramDecayHalfLife("unnamed"))
+				assert.Equal(t, GetAggregationsConfig().CPUHistogramDecayHalfLife, vpa.CPUHistogramDecayHalfLife("sidecar"),
+					"an exact policy takes precedence over the wildcard policy")
+			} else {
+				for _, name := range []string{"app", "unnamed", "sidecar"} {
+					assert.Equal(t, GetAggregationsConfig().CPUHistogramDecayHalfLife, vpa.CPUHistogramDecayHalfLife(name))
+				}
+			}
+			vpa.SetResourcePolicy(nil)
+			assert.Equal(t, GetAggregationsConfig().CPUHistogramDecayHalfLife, vpa.CPUHistogramDecayHalfLife("app"))
+		})
+	}
+}
 
 func TestMergeAggregateContainerState(t *testing.T) {
 	containersInitialAggregateState := ContainerNameToAggregateStateMap{}
@@ -590,4 +622,16 @@ func (k mockAggregateStateKey) Labels() labels.Labels {
 	// Should return empty on error
 	labels, _ := labels.ConvertSelectorToLabelsMap(k.labels)
 	return labels
+}
+
+func (k mockAggregateStateKey) LabelSetKey() string {
+	return k.labels
+}
+
+func (k mockAggregateStateKey) CPUHistogramDecayHalfLife() time.Duration {
+	return GetAggregationsConfig().CPUHistogramDecayHalfLife
+}
+
+func (k mockAggregateStateKey) OwnerVpaID() VpaID {
+	return VpaID{}
 }

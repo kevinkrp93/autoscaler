@@ -20,12 +20,15 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/version"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/ptr"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
@@ -35,6 +38,42 @@ const (
 	cpu    = apiv1.ResourceCPU
 	memory = apiv1.ResourceMemory
 )
+
+func TestValidateProfileConfiguration(t *testing.T) {
+	tests := []struct {
+		name      string
+		enabled   bool
+		halfLife  *metav1.Duration
+		threshold *float64
+		errorText string
+	}{
+		{name: "valid", enabled: true, halfLife: &metav1.Duration{Duration: 5 * time.Minute}, threshold: ptr.To(0.1)},
+		{name: "zero threshold", enabled: true, threshold: ptr.To(0.0)},
+		{name: "negative threshold", enabled: true, threshold: ptr.To(-0.1), errorText: "podUpdateThreshold must"},
+		{name: "zero half life", enabled: true, halfLife: &metav1.Duration{}, errorText: "cpuHistogramDecayHalfLife must"},
+		{name: "negative half life", enabled: true, halfLife: &metav1.Duration{Duration: -time.Minute}, errorText: "cpuHistogramDecayHalfLife must"},
+		{name: "half life feature disabled", halfLife: &metav1.Duration{Duration: time.Hour}, errorText: "PerVPAConfig is disabled"},
+		{name: "threshold feature disabled", threshold: ptr.To(0.1), errorText: "PerVPAConfig is disabled"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, tc.enabled)
+			mode := vpa_types.UpdateModeOff
+			vpa := &vpa_types.VerticalPodAutoscaler{Spec: vpa_types.VerticalPodAutoscalerSpec{
+				UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode, PodUpdateThreshold: tc.threshold},
+				ResourcePolicy: &vpa_types.PodResourcePolicy{ContainerPolicies: []vpa_types.ContainerResourcePolicy{
+					{ContainerName: "*", CPUHistogramDecayHalfLife: tc.halfLife},
+				}},
+			}}
+			err := ValidateVPA(vpa, false)
+			if tc.errorText == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tc.errorText)
+			}
+		})
+	}
+}
 
 func TestValidateVPA(t *testing.T) {
 	badUpdateMode := vpa_types.UpdateMode("bad")
@@ -373,7 +412,7 @@ func TestValidateVPA(t *testing.T) {
 				},
 			},
 			PerVPAConfigDisabled: true,
-			expectError:          errors.New("OOMBumpUpRatio and OOMMinBumpUp are not supported when feature flag PerVPAConfig is disabled"),
+			expectError:          errors.New("per-VPA container configuration is not supported when feature flag PerVPAConfig is disabled"),
 		},
 	}
 	for _, tc := range tests {

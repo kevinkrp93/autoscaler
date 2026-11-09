@@ -30,8 +30,10 @@ import (
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 )
 
 var (
@@ -394,6 +396,135 @@ func TestAddPodThenAddVpa(t *testing.T) {
 	vpa := addTestVpa(cluster)
 	aggregateStateKey := cluster.aggregateStateKeyForContainerID(testContainerID)
 	assert.Contains(t, vpa.aggregateContainerStates, aggregateStateKey)
+}
+
+func TestCPUHistogramDecayUsesVPASettingAndPreservesHistoryOnChange(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, true)
+	cluster := NewClusterState(testGcPeriod)
+	cluster.AddOrUpdatePod(testPodID, testLabels, apiv1.PodRunning)
+	assert.NoError(t, cluster.AddOrUpdateContainer(testContainerID, testRequest))
+	otherContainerID := ContainerID{testPodID, "container-2"}
+	assert.NoError(t, cluster.AddOrUpdateContainer(otherContainerID, testRequest))
+
+	preProfileSample := &ContainerUsageSample{
+		MeasureStart: testTimestamp,
+		Usage:        CPUAmountFromCores(0.1),
+		Resource:     ResourceCPU,
+	}
+	cluster.findOrCreateAggregateContainerState(testContainerID).AddSample(preProfileSample)
+	cluster.findOrCreateAggregateContainerState(otherContainerID).AddSample(preProfileSample)
+
+	selector := labels.Set(testLabels).AsSelector()
+	halfLife := time.Minute * 5
+	makeVPA := func(name string, duration time.Duration) *vpa_types.VerticalPodAutoscaler {
+		return &vpa_types.VerticalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Namespace: testPodID.Namespace, Name: name},
+			Spec: vpa_types.VerticalPodAutoscalerSpec{
+				ResourcePolicy: &vpa_types.PodResourcePolicy{
+					ContainerPolicies: []vpa_types.ContainerResourcePolicy{{
+						ContainerName:             testContainerID.ContainerName,
+						CPUHistogramDecayHalfLife: &metav1.Duration{Duration: duration},
+					}},
+				},
+			},
+		}
+	}
+	vpaObject := makeVPA("profile-vpa", halfLife)
+	vpaID := VpaID{Namespace: testPodID.Namespace, VpaName: vpaObject.Name}
+	assert.NoError(t, cluster.AddOrUpdateVpa(vpaObject, selector))
+	otherHalfLife := 12 * time.Hour
+	otherVPAObject := makeVPA("other-profile-vpa", otherHalfLife)
+	otherVPAID := VpaID{Namespace: testPodID.Namespace, VpaName: otherVPAObject.Name}
+	assert.NoError(t, cluster.AddOrUpdateVpa(otherVPAObject, selector))
+
+	profileSample := &ContainerUsageSample{
+		MeasureStart: testTimestamp.Add(time.Minute),
+		Usage:        CPUAmountFromCores(0.9),
+		Resource:     ResourceCPU,
+	}
+	cluster.addSampleToAggregations(testContainerID, profileSample, false)
+	vpa := cluster.vpas[vpaID]
+	profileState := vpa.AggregateStateByContainerName()[testContainerID.ContainerName]
+	assert.Equal(t, 2, profileState.TotalSamplesCount, "the profile must inherit existing history under the new decay")
+	assert.Equal(t, halfLife, profileState.CPUHistogramDecayHalfLife)
+	otherContainerState := vpa.AggregateStateByContainerName()[otherContainerID.ContainerName]
+	assert.Equal(t, 1, otherContainerState.TotalSamplesCount, "the VPA should retain history for containers using the unchanged default")
+	otherVPA := cluster.vpas[otherVPAID]
+	otherProfileState := otherVPA.AggregateStateByContainerName()[testContainerID.ContainerName]
+	assert.Equal(t, 2, otherProfileState.TotalSamplesCount)
+	assert.Equal(t, otherHalfLife, otherProfileState.CPUHistogramDecayHalfLife)
+	changedCheckpoint := NewAggregateContainerStateWithCPUHistogramDecayHalfLife(halfLife)
+	unchangedCheckpoint := NewAggregateContainerStateWithCPUHistogramDecayHalfLife(GetAggregationsConfig().CPUHistogramDecayHalfLife)
+	vpa.ContainersInitialAggregateState[testContainerID.ContainerName] = changedCheckpoint
+	vpa.ContainersInitialAggregateState[otherContainerID.ContainerName] = unchangedCheckpoint
+	beforeChange, err := vpa.AggregateStateByContainerName()[testContainerID.ContainerName].SaveToCheckpoint()
+	assert.NoError(t, err)
+
+	updatedHalfLife := time.Minute * 10
+	vpaObject.Spec.ResourcePolicy.ContainerPolicies[0].CPUHistogramDecayHalfLife =
+		&metav1.Duration{Duration: updatedHalfLife}
+	assert.NoError(t, cluster.AddOrUpdateVpa(vpaObject, selector))
+	afterChange, err := vpa.AggregateStateByContainerName()[testContainerID.ContainerName].SaveToCheckpoint()
+	assert.NoError(t, err)
+	assert.Equal(t, beforeChange.CPUHistogram, afterChange.CPUHistogram)
+	assert.Equal(t, beforeChange.MemoryHistogram, afterChange.MemoryHistogram)
+	updatedProfileSample := &ContainerUsageSample{
+		MeasureStart: testTimestamp.Add(2 * time.Minute),
+		Usage:        CPUAmountFromCores(0.2),
+		Resource:     ResourceCPU,
+	}
+	cluster.addSampleToAggregations(testContainerID, updatedProfileSample, false)
+
+	profileState = vpa.AggregateStateByContainerName()[testContainerID.ContainerName]
+	assert.Equal(t, 3, profileState.TotalSamplesCount, "changing the half-life must preserve old histogram weights")
+	assert.Equal(t, updatedHalfLife, profileState.CPUHistogramDecayHalfLife)
+	assert.Contains(t, vpa.ContainersInitialAggregateState, testContainerID.ContainerName,
+		"the changed container's checkpoint must be preserved")
+	assert.Equal(t, updatedHalfLife, vpa.ContainersInitialAggregateState[testContainerID.ContainerName].CPUHistogramDecayHalfLife)
+	assert.Same(t, unchangedCheckpoint, vpa.ContainersInitialAggregateState[otherContainerID.ContainerName],
+		"the unchanged container's checkpoint must be retained")
+	otherProfileState = otherVPA.AggregateStateByContainerName()[testContainerID.ContainerName]
+	assert.Equal(t, 3, otherProfileState.TotalSamplesCount, "updating one VPA must not reset another profile's history")
+	assert.Equal(t, otherHalfLife, otherProfileState.CPUHistogramDecayHalfLife)
+	cluster.addSampleToAggregations(otherContainerID, updatedProfileSample, false)
+	otherContainerState = vpa.AggregateStateByContainerName()[otherContainerID.ContainerName]
+	assert.Equal(t, 2, otherContainerState.TotalSamplesCount,
+		"changing one container's half-life must not reset another container's history")
+
+	for key, state := range otherVPA.aggregateContainerStates {
+		if key.ContainerName() == testContainerID.ContainerName {
+			state.AddSample(&ContainerUsageSample{
+				MeasureStart: testTimestamp.Add(3 * time.Minute),
+				Usage:        CPUAmountFromCores(1.7),
+				Resource:     ResourceCPU,
+			})
+		}
+	}
+	otherHistory, err := otherVPA.AggregateStateByContainerName()[testContainerID.ContainerName].SaveToCheckpoint()
+	assert.NoError(t, err)
+	// Move to an already-used half-life without taking another VPA's history,
+	// then return to the original half-life without resurrecting a stale copy.
+	for _, nextHalfLife := range []time.Duration{otherHalfLife, halfLife} {
+		vpaObject.Spec.ResourcePolicy.ContainerPolicies[0].CPUHistogramDecayHalfLife =
+			&metav1.Duration{Duration: nextHalfLife}
+		assert.NoError(t, cluster.AddOrUpdateVpa(vpaObject, selector))
+		state := vpa.AggregateStateByContainerName()[testContainerID.ContainerName]
+		assert.Equal(t, 3, state.TotalSamplesCount)
+		assert.Equal(t, nextHalfLife, state.CPUHistogramDecayHalfLife)
+		assert.Equal(t, otherHalfLife, otherVPA.CPUHistogramDecayHalfLife(testContainerID.ContainerName))
+		otherHistoryAfter, err := otherVPA.AggregateStateByContainerName()[testContainerID.ContainerName].SaveToCheckpoint()
+		assert.NoError(t, err)
+		assert.Equal(t, otherHistory.CPUHistogram, otherHistoryAfter.CPUHistogram,
+			"another VPA's differently weighted data must remain unchanged")
+		assert.Equal(t, 4, otherHistoryAfter.TotalSamplesCount)
+	}
+	privateAggregations := 0
+	for key := range cluster.aggregateStateMap {
+		if key.OwnerVpaID() == vpaID && key.ContainerName() == testContainerID.ContainerName {
+			privateAggregations++
+		}
+	}
+	assert.Equal(t, 1, privateAggregations, "profile changes must not retain old private histories")
 }
 
 // Creates a VPA and a matching pod, then change the pod labels such that it is

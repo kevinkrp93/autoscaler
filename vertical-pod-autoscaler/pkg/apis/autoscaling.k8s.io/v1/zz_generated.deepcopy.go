@@ -24,6 +24,7 @@ package v1
 import (
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -72,6 +73,11 @@ func (in *ContainerResourcePolicy) DeepCopyInto(out *ContainerResourcePolicy) {
 		in, out := &in.OOMMinBumpUp, &out.OOMMinBumpUp
 		x := (*in).DeepCopy()
 		*out = &x
+	}
+	if in.CPUHistogramDecayHalfLife != nil {
+		in, out := &in.CPUHistogramDecayHalfLife, &out.CPUHistogramDecayHalfLife
+		*out = new(metav1.Duration)
+		**out = **in
 	}
 	return
 }
@@ -177,6 +183,11 @@ func (in *PodUpdatePolicy) DeepCopyInto(out *PodUpdatePolicy) {
 				(*in).DeepCopyInto(*out)
 			}
 		}
+	}
+	if in.PodUpdateThreshold != nil {
+		in, out := &in.PodUpdateThreshold, &out.PodUpdateThreshold
+		*out = new(float64)
+		**out = **in
 	}
 	return
 }

@@ -3,6 +3,7 @@
 ## Contents
 
 <!-- toc -->
+- [Per-VPA tuning (alpha)](#per-vpa-tuning-alpha)
 - [Limits control](#limits-control)
 - [Memory Value Humanization](#memory-value-humanization)
 - [CPU Recommendation Rounding](#cpu-recommendation-rounding)
@@ -17,6 +18,76 @@
   - [Fallback Behavior](#fallback-behavior)
   - [Monitoring](#monitoring)
 <!-- /toc -->
+
+## Per-VPA tuning (alpha)
+
+This fork extends AEP-8026's `PerVPAConfig` feature with CPU histogram decay
+and pod update sensitivity. Enable `--feature-gates=PerVPAConfig=true` on the
+recommender, updater, and admission controller, and install the matching CRDs.
+These fields are experimental fork extensions, not an approved upstream API.
+One shared recommender and updater can process different settings concurrently.
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: checkout
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout
+  updatePolicy:
+    updateMode: Recreate
+    podUpdateThreshold: 0.1
+  resourcePolicy:
+    containerPolicies:
+      - containerName: "*"
+        cpuHistogramDecayHalfLife: 5m
+```
+
+`cpuHistogramDecayHalfLife` overrides `--cpu-histogram-decay-half-life` for a
+named container, or all containers through `"*"`. Exact container policies take
+precedence over the wildcard policy, following existing VPA policy resolution.
+An omitted value uses the global flag. Half-life must be positive; it is a decay
+rate, not a retention window. Memory decay is unchanged.
+
+`podUpdateThreshold` overrides `--pod-update-threshold` for the whole VPA.
+It must be nonnegative; zero is supported. It changes the existing
+resource-difference threshold, not the updater's other eligibility rules, age
+checks, out-of-range handling, disruption budgets, or minimum replicas.
+Omitting the field retains the global setting.
+
+When a half-life changes, existing bucket weights and reference timestamps are
+carried forward unchanged, as with restoring an existing VPA checkpoint under
+a different global half-life. Historical sample weights are not recalculated,
+and history is not reset. New samples use the selected half-life. Checkpoint
+format and restoration semantics remain unchanged.
+
+With `PerVPAConfig` enabled, live aggregations are scoped to each VPA so changing
+one VPA/container cannot modify another's history, even if they select the same
+pods. The changed container's aggregate is copied under its new half-life and
+its old private aggregate is removed; other containers retain their histories.
+A global-default aggregate is also maintained to bootstrap newly added VPAs.
+This adds CPU sample-processing and histogram memory overhead proportional to
+the number of matching VPAs, including copies of the unchanged memory histogram.
+The feature gate defaults to false, retaining the existing shared aggregation
+behavior; admission rejects the new fields when the gate is disabled.
+
+A separate profile operator can translate named workload presets into these
+VPA fields. Changing the workload's metadata annotation does not itself roll
+out pods; the normal VPA update mechanism applies resulting recommendations.
+
+To build only the three VPA component images, run from
+`vertical-pod-autoscaler/` (not the repository root):
+
+```sh
+docker build -f pkg/recommender/Dockerfile -t vpa-recommender:profiles .
+docker build -f pkg/updater/Dockerfile -t vpa-updater:profiles .
+docker build -f pkg/admission-controller/Dockerfile -t vpa-admission-controller:profiles .
+```
+
+These builds do not build Cluster Autoscaler or other repository components.
 
 ## Limits control
 

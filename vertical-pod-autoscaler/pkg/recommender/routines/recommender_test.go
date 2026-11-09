@@ -347,3 +347,15 @@ func (k mockAggregateStateKey) Labels() labels.Labels {
 	labels, _ := labels.ConvertSelectorToLabelsMap(k.labels)
 	return labels
 }
+
+func (k mockAggregateStateKey) LabelSetKey() string {
+	return k.labels
+}
+
+func (k mockAggregateStateKey) CPUHistogramDecayHalfLife() time.Duration {
+	return model.GetAggregationsConfig().CPUHistogramDecayHalfLife
+}
+
+func (k mockAggregateStateKey) OwnerVpaID() model.VpaID {
+	return model.VpaID{}
+}

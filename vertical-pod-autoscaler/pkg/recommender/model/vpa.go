@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	metrics_quality "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/quality"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -245,7 +246,7 @@ func (vpa *Vpa) SetAPIVersion(to string) {
 // UseAggregationIfMatching checks if the given aggregation matches (contributes to) this VPA
 // and adds it to the set of VPA's aggregations if that is the case.
 func (vpa *Vpa) UseAggregationIfMatching(aggregationKey AggregateStateKey, aggregation *AggregateContainerState) {
-	if vpa.UsesAggregation(aggregationKey) {
+	if vpa.usesExactAggregation(aggregationKey) {
 		// Already linked, we can return quickly.
 		return
 	}
@@ -282,6 +283,17 @@ func (vpa *Vpa) GetRecommendation() *vpa_types.RecommendedPodResources {
 
 // UsesAggregation returns true iff an aggregation with the given key contributes to the VPA.
 func (vpa *Vpa) UsesAggregation(aggregationKey AggregateStateKey) bool {
+	for existingKey := range vpa.aggregateContainerStates {
+		if existingKey.Namespace() == aggregationKey.Namespace() &&
+			existingKey.ContainerName() == aggregationKey.ContainerName() &&
+			existingKey.LabelSetKey() == aggregationKey.LabelSetKey() {
+			return true
+		}
+	}
+	return false
+}
+
+func (vpa *Vpa) usesExactAggregation(aggregationKey AggregateStateKey) bool {
 	_, exists := vpa.aggregateContainerStates[aggregationKey]
 	return exists
 }
@@ -301,7 +313,7 @@ func (vpa *Vpa) MergeCheckpointedState(aggregateContainerStateMap ContainerNameT
 	for containerName, aggregation := range vpa.ContainersInitialAggregateState {
 		aggregateContainerState, found := aggregateContainerStateMap[containerName]
 		if !found {
-			aggregateContainerState = NewAggregateContainerState()
+			aggregateContainerState = NewAggregateContainerStateWithCPUHistogramDecayHalfLife(vpa.CPUHistogramDecayHalfLife(containerName))
 			aggregateContainerStateMap[containerName] = aggregateContainerState
 		}
 		aggregateContainerState.MergeContainerState(aggregation)
@@ -325,19 +337,66 @@ func (vpa *Vpa) HasRecommendation() bool {
 
 // matchesAggregation returns true iff the VPA matches the given aggregation key.
 func (vpa *Vpa) matchesAggregation(aggregationKey AggregateStateKey) bool {
-	if vpa.ID.Namespace != aggregationKey.Namespace() {
-		return false
+	owner := VpaID{}
+	if features.Enabled(features.PerVPAConfig) {
+		owner = vpa.ID
 	}
-	return vpa.PodSelector != nil && vpa.PodSelector.Matches(aggregationKey.Labels())
+	return vpa.matchesLabels(aggregationKey.Namespace(), aggregationKey.ContainerName(), aggregationKey.Labels()) &&
+		aggregationKey.OwnerVpaID() == owner &&
+		vpa.CPUHistogramDecayHalfLife(aggregationKey.ContainerName()) == aggregationKey.CPUHistogramDecayHalfLife()
+}
+
+func (vpa *Vpa) matchesLabels(namespace, containerName string, podLabels labels.Labels) bool {
+	return vpa.ID.Namespace == namespace && vpa.PodSelector != nil && vpa.PodSelector.Matches(podLabels)
+}
+
+// CPUHistogramDecayHalfLife returns the effective CPU histogram decay for a
+// container, falling back to the recommender's global setting.
+func (vpa *Vpa) CPUHistogramDecayHalfLife(containerName string) time.Duration {
+	defaultHalfLife := GetAggregationsConfig().CPUHistogramDecayHalfLife
+	if !features.Enabled(features.PerVPAConfig) {
+		return defaultHalfLife
+	}
+	policy := vpa_api_util.GetContainerResourcePolicy(containerName, vpa.ResourcePolicy)
+	if policy == nil || policy.CPUHistogramDecayHalfLife == nil {
+		return defaultHalfLife
+	}
+	return policy.CPUHistogramDecayHalfLife.Duration
+}
+
+func (vpa *Vpa) changedCPUHistogramDecayContainers(newPolicy *vpa_types.PodResourcePolicy) map[string]struct{} {
+	containerNames := make(map[string]struct{})
+	for key := range vpa.aggregateContainerStates {
+		containerNames[key.ContainerName()] = struct{}{}
+	}
+	for containerName := range vpa.ContainersInitialAggregateState {
+		containerNames[containerName] = struct{}{}
+	}
+	changed := make(map[string]struct{})
+	for containerName := range containerNames {
+		oldHalfLife := vpa.CPUHistogramDecayHalfLife(containerName)
+		newHalfLife := GetAggregationsConfig().CPUHistogramDecayHalfLife
+		if features.Enabled(features.PerVPAConfig) {
+			policy := vpa_api_util.GetContainerResourcePolicy(containerName, newPolicy)
+			if policy != nil && policy.CPUHistogramDecayHalfLife != nil {
+				newHalfLife = policy.CPUHistogramDecayHalfLife.Duration
+			}
+		}
+		if oldHalfLife != newHalfLife {
+			changed[containerName] = struct{}{}
+		}
+	}
+	return changed
 }
 
 // SetResourcePolicy updates the resource policy of the VPA and the scaling
 // policies of aggregators under this VPA.
 func (vpa *Vpa) SetResourcePolicy(resourcePolicy *vpa_types.PodResourcePolicy) {
-	if resourcePolicy == vpa.ResourcePolicy {
-		return
+	if resourcePolicy == nil {
+		vpa.ResourcePolicy = nil
+	} else {
+		vpa.ResourcePolicy = resourcePolicy.DeepCopy()
 	}
-	vpa.ResourcePolicy = resourcePolicy
 	for container, state := range vpa.aggregateContainerStates {
 		state.UpdateFromPolicy(vpa_api_util.GetContainerResourcePolicy(container.ContainerName(), vpa.ResourcePolicy))
 	}

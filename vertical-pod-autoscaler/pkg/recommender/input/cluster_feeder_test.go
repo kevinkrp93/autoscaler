@@ -32,10 +32,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2/ktesting"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	fakeautoscalingv1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/typed/autoscaling.k8s.io/v1/fake"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/history"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/metrics"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/spec"
@@ -744,6 +746,61 @@ func TestClusterStateFeeder_InitFromHistoryProvider(t *testing.T) {
 		return
 	}
 	assert.Equal(t, memAmount, containerState.GetMaxMemoryPeak())
+}
+
+func TestInitFromHistoryProviderUsesLoadedVpaHalfLife(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, true)
+	podID := model.PodID{Namespace: "ns", PodName: "profiled-pod"}
+	halfLife := 5 * time.Minute
+	vpaObject := &vpa_types.VerticalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{Namespace: podID.Namespace, Name: "profiled-vpa"},
+		Spec: vpa_types.VerticalPodAutoscalerSpec{
+			ResourcePolicy: &vpa_types.PodResourcePolicy{
+				ContainerPolicies: []vpa_types.ContainerResourcePolicy{{
+					ContainerName: "*", CPUHistogramDecayHalfLife: &metav1.Duration{Duration: halfLife},
+				}},
+			},
+		},
+	}
+	cluster := model.NewClusterState(testGcPeriod)
+	selector := labels.Set{"app": "profiled"}.AsSelector()
+	if err := cluster.AddOrUpdateVpa(vpaObject, selector); err != nil {
+		t.Fatal(err)
+	}
+	timestamp := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	provider := fakeHistoryProvider{history: map[model.PodID]*history.PodHistory{
+		podID: {
+			LastLabels: map[string]string{"app": "profiled"},
+			LastSeen:   timestamp,
+			Samples: map[string][]model.ContainerUsageSample{
+				"app": {{
+					MeasureStart: timestamp,
+					Usage:        model.CPUAmountFromCores(1),
+					Resource:     model.ResourceCPU,
+				}, {
+					MeasureStart: timestamp.Add(20 * time.Minute),
+					Usage:        model.CPUAmountFromCores(0.1),
+					Resource:     model.ResourceCPU,
+				}},
+			},
+		},
+	}}
+	feeder := clusterStateFeeder{clusterState: cluster}
+	feeder.InitFromHistoryProvider(&provider)
+	state := cluster.VPAs()[model.VpaID{Namespace: podID.Namespace, VpaName: vpaObject.Name}].
+		AggregateStateByContainerName()["app"]
+	if state.CPUHistogramDecayHalfLife != halfLife {
+		t.Fatalf("historical samples used half-life %s, want profile half-life %s", state.CPUHistogramDecayHalfLife, halfLife)
+	}
+	if state.TotalSamplesCount != 2 {
+		t.Fatalf("expected two replayed CPU samples, got %d", state.TotalSamplesCount)
+	}
+	checkpoint, err := state.AggregateCPUUsage.SaveToChekpoint()
+	assert.NoError(t, err)
+	options := model.GetAggregationsConfig().CPUHistogramOptions
+	assert.InDelta(t, 1.0/16.0,
+		float64(checkpoint.BucketWeights[options.FindBucket(1)])/float64(checkpoint.BucketWeights[options.FindBucket(0.1)]), 0.0002,
+		"raw history must be weighted with the profile half-life, not cloned after weighting with the global default")
 }
 
 func TestFilterVPAs(t *testing.T) {

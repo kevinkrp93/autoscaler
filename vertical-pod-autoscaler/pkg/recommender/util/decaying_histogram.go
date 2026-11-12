@@ -46,7 +46,8 @@ type decayingHistogram struct {
 	// Decay half life period.
 	halfLife time.Duration
 	// Reference time for determining the relative age of samples.
-	// It is always an integer multiple of halfLife.
+	// Usually an integer multiple of halfLife; restored or cloned histograms
+	// can retain a reference timestamp from a different half-life.
 	referenceTimestamp time.Time
 }
 
@@ -108,10 +109,8 @@ func (h *decayingHistogram) String() string {
 }
 
 func (h *decayingHistogram) shiftReferenceTimestamp(newreferenceTimestamp time.Time) {
-	// Make sure the decay start is an integer multiple of halfLife.
-	newreferenceTimestamp = newreferenceTimestamp.Round(h.halfLife)
-	exponent := round(float64(h.referenceTimestamp.Sub(newreferenceTimestamp)) / float64(h.halfLife))
-	h.scale(math.Ldexp(1., exponent)) // Scale all weights by 2^exponent.
+	exponent := float64(h.referenceTimestamp.Sub(newreferenceTimestamp)) / float64(h.halfLife)
+	h.scale(math.Exp2(exponent))
 	h.referenceTimestamp = newreferenceTimestamp
 }
 
@@ -123,7 +122,7 @@ func (h *decayingHistogram) decayFactor(timestamp time.Time) float64 {
 		// The exponent has grown too large. Renormalize the histogram by
 		// shifting the referenceTimestamp to the current timestamp and rescaling
 		// the weights accordingly.
-		h.shiftReferenceTimestamp(timestamp)
+		h.shiftReferenceTimestamp(timestamp.Round(h.halfLife))
 	}
 	return math.Exp2(float64(timestamp.Sub(h.referenceTimestamp)) / float64(h.halfLife))
 }

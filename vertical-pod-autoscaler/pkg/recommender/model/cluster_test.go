@@ -527,6 +527,35 @@ func TestCPUHistogramDecayUsesVPASettingAndPreservesHistoryOnChange(t *testing.T
 	assert.Equal(t, 1, privateAggregations, "profile changes must not retain old private histories")
 }
 
+func TestPerVPAConfigDisabledUsesSharedAggregatePath(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, false)
+	cluster := NewClusterState(testGcPeriod)
+	cluster.AddOrUpdatePod(testPodID, testLabels, apiv1.PodRunning)
+	assert.NoError(t, cluster.AddOrUpdateContainer(testContainerID, testRequest))
+	selector := labels.Set(testLabels).AsSelector()
+	for i := 0; i < 100; i++ {
+		id := VpaID{Namespace: "unrelated", VpaName: fmt.Sprintf("vpa-%d", i)}
+		cluster.vpas[id] = NewVpa(id, labels.Everything(), anyTime)
+	}
+	matching := &vpa_types.VerticalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testPodID.Namespace, Name: "matching"},
+	}
+	assert.NoError(t, cluster.AddOrUpdateVpa(matching, selector))
+	assert.NoError(t, cluster.AddSample(&ContainerUsageSampleWithKey{
+		Container: testContainerID,
+		ContainerUsageSample: ContainerUsageSample{
+			MeasureStart: testTimestamp.Add(time.Minute),
+			Usage:        CPUAmountFromCores(0.25),
+			Resource:     ResourceCPU,
+		},
+	}))
+	assert.Len(t, cluster.aggregateStateMap, 1, "feature-off ingestion must use only the shared default aggregation")
+	for key, state := range cluster.aggregateStateMap {
+		assert.Equal(t, VpaID{}, key.OwnerVpaID())
+		assert.Equal(t, 1, state.TotalSamplesCount)
+	}
+}
+
 // Creates a VPA and a matching pod, then change the pod labels such that it is
 // no longer matched by the VPA. Verifies that the links between the pod and the
 // VPA are removed.

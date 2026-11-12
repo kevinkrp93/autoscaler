@@ -17,14 +17,71 @@ limitations under the License.
 package util
 
 import (
+	"fmt"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 )
+
+func TestMergeAfterHalfLifeChangeAlignsNonMultipleReferenceTimestamps(t *testing.T) {
+	firstTime := time.Date(2026, 1, 1, 6, 0, 0, 0, time.UTC)
+	secondTime := firstTime.Add(6 * time.Hour)
+	for _, restored := range []bool{false, true} {
+		for _, reversed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("checkpoint-%t/reversed-%t", restored, reversed), func(t *testing.T) {
+				first := NewDecayingHistogram(testHistogramOptions, 5*time.Minute)
+				first.AddSample(1, 1, firstTime)
+				second := NewDecayingHistogram(testHistogramOptions, 5*time.Minute)
+				second.AddSample(4, 1, secondTime)
+				convert := func(source Histogram) Histogram {
+					if !restored {
+						return CloneDecayingHistogramWithHalfLife(source, 24*time.Hour)
+					}
+					checkpoint, err := source.SaveToChekpoint()
+					require.NoError(t, err)
+					result := NewDecayingHistogram(testHistogramOptions, 24*time.Hour)
+					require.NoError(t, result.LoadFromCheckpoint(checkpoint))
+					return result
+				}
+				left, right := convert(first), convert(second)
+				if reversed {
+					left, right = right, left
+				}
+				left.Merge(right)
+				histogram := left.(*decayingHistogram)
+				firstWeight := histogram.bucketWeight[testHistogramOptions.FindBucket(1)]
+				secondWeight := histogram.bucketWeight[testHistogramOptions.FindBucket(4)]
+				assert.Equal(t, secondTime, histogram.referenceTimestamp,
+					"merge must align to the actual reference, not round it to the new half-life")
+				assert.InDelta(t, math.Exp2(-6.0/24.0), firstWeight/secondWeight, 1e-12,
+					"reference alignment must uniformly scale old weights by the exact fractional decay")
+				assert.Equal(t, float64(2), left.Percentile(0.4))
+				assert.Equal(t, float64(5), left.Percentile(0.5))
+			})
+		}
+	}
+}
+
+func TestHalfLifeChangeRenormalizesNonAlignedReferenceWithoutWeightBias(t *testing.T) {
+	firstTime := time.Date(2026, 1, 1, 6, 5, 0, 0, time.UTC)
+	source := NewDecayingHistogram(testHistogramOptions, 5*time.Minute)
+	source.AddSample(1, 1e40, firstTime)
+	changed := CloneDecayingHistogramWithHalfLife(source, 24*time.Hour).(*decayingHistogram)
+	changed.AddSample(4, 1, firstTime.Add(101*24*time.Hour))
+	firstWeight := changed.bucketWeight[testHistogramOptions.FindBucket(1)]
+	secondWeight := changed.bucketWeight[testHistogramOptions.FindBucket(4)]
+	require.Positive(t, secondWeight)
+	assert.InEpsilon(t, 1e40*math.Exp2(-101), firstWeight/secondWeight, 1e-12,
+		"renormalization must retain the exact decay from the preserved fractional reference")
+	assert.Equal(t, 1e40, source.(*decayingHistogram).bucketWeight[testHistogramOptions.FindBucket(1)],
+		"renormalizing the copy must not mutate the source")
+}
 
 var (
 	startTime = time.Unix(1234567890, 0) // Arbitrary timestamp.

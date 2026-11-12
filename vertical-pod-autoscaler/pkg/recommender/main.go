@@ -356,6 +356,9 @@ func run(ctx context.Context, healthCheck *metrics.HealthCheck, commonFlag *comm
 			klog.ErrorS(err, "Could not initialize history provider")
 			klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 		}
+		// Configure each VPA before replaying raw samples so history is
+		// weighted with its effective per-container half-life.
+		recommender.GetClusterStateFeeder().LoadVPAs(ctx)
 		recommender.GetClusterStateFeeder().InitFromHistoryProvider(provider)
 	}
 

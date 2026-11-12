@@ -511,7 +511,7 @@ func (cluster *clusterState) findOrCreateAggregation(key aggregateStateKey) *Agg
 
 func (cluster *clusterState) findOrCreateAggregateContainerStateForContainer(containerID ContainerID) *AggregateContainerState {
 	pod := cluster.pods[containerID.PodID]
-	if pod == nil {
+	if pod == nil || !features.Enabled(features.PerVPAConfig) {
 		return cluster.findOrCreateAggregateContainerState(containerID)
 	}
 	podLabels := cluster.labelSetMap[pod.labelSetKey]
@@ -526,6 +526,15 @@ func (cluster *clusterState) findOrCreateAggregateContainerStateForContainer(con
 func (cluster *clusterState) addSampleToAggregations(containerID ContainerID, sample *ContainerUsageSample, subtract bool) {
 	pod := cluster.pods[containerID.PodID]
 	if pod == nil {
+		return
+	}
+	if !features.Enabled(features.PerVPAConfig) {
+		aggregation := cluster.findOrCreateAggregateContainerState(containerID)
+		if subtract {
+			aggregation.SubtractSample(sample)
+		} else {
+			aggregation.AddSample(sample)
+		}
 		return
 	}
 	podLabels := cluster.labelSetMap[pod.labelSetKey]
@@ -608,10 +617,12 @@ func (cluster *clusterState) getContributiveAggregateStateKeys(ctx context.Conte
 		if podActive || podControllerExists {
 			for container := range pod.Containers {
 				contributiveKeys[cluster.MakeAggregateStateKey(pod, container)] = true
-				for _, vpa := range cluster.vpas {
-					if vpa.matchesLabels(pod.ID.Namespace, container, cluster.labelSetMap[pod.labelSetKey]) {
-						key := cluster.aggregateStateKeyForVpa(pod, container, vpa)
-						contributiveKeys[key] = true
+				if features.Enabled(features.PerVPAConfig) {
+					for _, vpa := range cluster.vpas {
+						if vpa.matchesLabels(pod.ID.Namespace, container, cluster.labelSetMap[pod.labelSetKey]) {
+							key := cluster.aggregateStateKeyForVpa(pod, container, vpa)
+							contributiveKeys[key] = true
+						}
 					}
 				}
 			}

@@ -283,14 +283,16 @@ func (vpa *Vpa) GetRecommendation() *vpa_types.RecommendedPodResources {
 
 // UsesAggregation returns true iff an aggregation with the given key contributes to the VPA.
 func (vpa *Vpa) UsesAggregation(aggregationKey AggregateStateKey) bool {
-	for existingKey := range vpa.aggregateContainerStates {
-		if existingKey.Namespace() == aggregationKey.Namespace() &&
-			existingKey.ContainerName() == aggregationKey.ContainerName() &&
-			existingKey.LabelSetKey() == aggregationKey.LabelSetKey() {
-			return true
-		}
+	key, ok := aggregationKey.(aggregateStateKey)
+	if !ok {
+		return false
 	}
-	return false
+	key.cpuHalfLife = vpa.CPUHistogramDecayHalfLife(key.containerName)
+	key.ownerVpaID = VpaID{}
+	if features.Enabled(features.PerVPAConfig) {
+		key.ownerVpaID = vpa.ID
+	}
+	return vpa.usesExactAggregation(key)
 }
 
 func (vpa *Vpa) usesExactAggregation(aggregationKey AggregateStateKey) bool {

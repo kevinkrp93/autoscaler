@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,27 +50,34 @@ func TestValidateProfileConfiguration(t *testing.T) {
 	}{
 		{name: "valid", enabled: true, halfLife: &metav1.Duration{Duration: 5 * time.Minute}, threshold: ptr.To(0.1)},
 		{name: "zero threshold", enabled: true, threshold: ptr.To(0.0)},
+		{name: "defaults with feature disabled"},
 		{name: "negative threshold", enabled: true, threshold: ptr.To(-0.1), errorText: "podUpdateThreshold must"},
 		{name: "zero half life", enabled: true, halfLife: &metav1.Duration{}, errorText: "cpuHistogramDecayHalfLife must"},
 		{name: "negative half life", enabled: true, halfLife: &metav1.Duration{Duration: -time.Minute}, errorText: "cpuHistogramDecayHalfLife must"},
 		{name: "half life feature disabled", halfLife: &metav1.Duration{Duration: time.Hour}, errorText: "PerVPAConfig is disabled"},
 		{name: "threshold feature disabled", threshold: ptr.To(0.1), errorText: "PerVPAConfig is disabled"},
+		{name: "zero threshold feature disabled", threshold: ptr.To(0.0), errorText: "PerVPAConfig is disabled"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, tc.enabled)
 			mode := vpa_types.UpdateModeOff
 			vpa := &vpa_types.VerticalPodAutoscaler{Spec: vpa_types.VerticalPodAutoscalerSpec{
+				TargetRef:    &autoscalingv1.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "example"},
 				UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode, PodUpdateThreshold: tc.threshold},
 				ResourcePolicy: &vpa_types.PodResourcePolicy{ContainerPolicies: []vpa_types.ContainerResourcePolicy{
 					{ContainerName: "*", CPUHistogramDecayHalfLife: tc.halfLife},
 				}},
 			}}
-			err := ValidateVPA(vpa, false)
-			if tc.errorText == "" {
-				assert.NoError(t, err)
-			} else {
-				assert.ErrorContains(t, err, tc.errorText)
+			for _, isCreate := range []bool{false, true} {
+				t.Run(fmt.Sprintf("create-%t", isCreate), func(t *testing.T) {
+					err := ValidateVPA(vpa, isCreate)
+					if tc.errorText == "" {
+						assert.NoError(t, err)
+					} else {
+						assert.ErrorContains(t, err, tc.errorText)
+					}
+				})
 			}
 		})
 	}

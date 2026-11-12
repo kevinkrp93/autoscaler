@@ -62,17 +62,27 @@ When a half-life changes, existing bucket weights and reference timestamps are
 carried forward unchanged, as with restoring an existing VPA checkpoint under
 a different global half-life. Historical sample weights are not recalculated,
 and history is not reset. New samples use the selected half-life. Checkpoint
-format and restoration semantics remain unchanged.
+format and weight-preserving restoration remain unchanged. When histograms
+are merged, their reference timestamps are aligned exactly, including when
+a preserved timestamp is not a multiple of the newly selected half-life.
+Alignment scales all buckets uniformly; it does not reconstruct or reweight
+individual historical samples.
+
+On Prometheus-backed startup, VPA policies are loaded before raw historical
+samples are replayed. Those raw samples are weighted with their effective
+per-container half-lives, unlike already-weighted checkpoint data.
 
 With `PerVPAConfig` enabled, live aggregations are scoped to each VPA so changing
 one VPA/container cannot modify another's history, even if they select the same
 pods. The changed container's aggregate is copied under its new half-life and
 its old private aggregate is removed; other containers retain their histories.
 A global-default aggregate is also maintained to bootstrap newly added VPAs.
-This adds CPU sample-processing and histogram memory overhead proportional to
-the number of matching VPAs, including copies of the unchanged memory histogram.
-The feature gate defaults to false, retaining the existing shared aggregation
-behavior; admission rejects the new fields when the gate is disabled.
+Sample routing checks the existing VPAs and fans out to matches; matching work
+therefore scales with VPA count, while histogram copies and sample additions
+grow with the number of matching VPAs. This includes copies of the unchanged
+memory histogram. The feature gate defaults to false, retaining shared
+aggregation without the additional per-sample VPA selector scans; admission
+rejects the new fields when the gate is disabled.
 
 A separate profile operator can translate named workload presets into these
 VPA fields. Changing the workload's metadata annotation does not itself roll
@@ -88,6 +98,25 @@ docker build -f pkg/admission-controller/Dockerfile -t vpa-admission-controller:
 ```
 
 These builds do not build Cluster Autoscaler or other repository components.
+
+Regression tests can be run without a cluster or container images:
+
+```sh
+go test ./pkg/recommender/... ./pkg/updater/... ./pkg/admission-controller/resource/vpa ./pkg/apis/autoscaling.k8s.io/v1
+go test -race ./pkg/recommender/... ./pkg/updater/... ./pkg/admission-controller/resource/vpa ./pkg/apis/autoscaling.k8s.io/v1
+```
+
+Tests measure histogram bucket-weight ratios, actual CPU recommendations,
+history preservation and isolation across profile changes, memory peak
+replacement, checkpoint writes/restoration through fake API clients, and
+raw-history replay. Updater tests use real resource-difference calculations
+to cover threshold boundaries, pod totals, simultaneous profiles, and the
+existing age, out-of-range, and quick-OOM rules. They do not replace
+live-cluster validation of metrics collection, admission, or pod eviction.
+An additional fake-cluster simulation runs two-minute and ten-minute profiles
+concurrently through a shared recommender and updater selection path, persists
+their recommendations, and changes only one VPA's decay and update threshold
+to verify that the other VPA's settings, history, and recommendation stay intact.
 
 ## Limits control
 

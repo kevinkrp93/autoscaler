@@ -1,11 +1,6 @@
 name: Publish VPA profile images
 
 on:
-  push:
-    branches: [vpa-profile-poc]
-    paths:
-      - .github/workflows/publish-vpa-profile-images.yaml
-      - vertical-pod-autoscaler/**
   workflow_dispatch:
 
 permissions:
@@ -24,6 +19,12 @@ jobs:
       matrix:
         component: [recommender, updater, admission-controller]
     steps:
+      - name: Require the profile branch
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/vpa-profile-poc" ]; then
+            echo "::error::Select the vpa-profile-poc branch when running this workflow."
+            exit 1
+          fi
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Log in to GHCR

@@ -57,3 +57,37 @@ func TestSharedUpdaterReevaluatesEachVPAThresholdOnEveryPass(t *testing.T) {
 	assert.Empty(t, updater.getPodsUpdateOrder(pods, aggressive), "a changed policy must be applied on the next updater pass")
 	assert.Equal(t, pods, updater.getPodsUpdateOrder(pods, conservative))
 }
+
+func TestSharedUpdaterAppliesEachVPALifetimeOverride(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, true)
+	pod := test.Pod().WithName("pod").AddContainer(test.Container().WithName("app").
+		WithCPURequest(resource.MustParse("4")).Get()).Get()
+	pod.Status.StartTime = &metav1.Time{Time: time.Now().Add(-5 * time.Minute)}
+	immediate := test.VerticalPodAutoscaler().WithName("immediate").WithContainer("app").
+		WithTarget("5", "").WithLowerBound("1", "").WithUpperBound("8", "").Get()
+	immediate.Spec.UpdatePolicy = &vpa_types.PodUpdatePolicy{
+		InRecommendationBoundsEvictionLifetimeThreshold: &metav1.Duration{Duration: 0},
+	}
+	defaulted := immediate.DeepCopy()
+	defaulted.Name = "defaulted"
+	defaulted.Spec.UpdatePolicy = nil
+	updater := &updater{
+		recommendationProcessor: &test.FakeRecommendationProcessor{},
+		priorityProcessor:       priority.NewProcessor(),
+		evictionAdmission:       priority.NewDefaultPodEvictionAdmission(),
+	}
+	pods := []*corev1.Pod{pod}
+	assert.Equal(t, pods, updater.getPodsUpdateOrder(pods, immediate), "0s override must allow a young in-range pod")
+	assert.Empty(t, updater.getPodsUpdateOrder(pods, defaulted), "VPA without override must keep the 12h global default")
+
+	immediate.Spec.UpdatePolicy.InRecommendationBoundsEvictionLifetimeThreshold = &metav1.Duration{Duration: time.Hour}
+	defaulted.Spec.UpdatePolicy = &vpa_types.PodUpdatePolicy{
+		InRecommendationBoundsEvictionLifetimeThreshold: &metav1.Duration{Duration: time.Minute},
+	}
+	assert.Empty(t, updater.getPodsUpdateOrder(pods, immediate), "changed override must apply on the next pass")
+	assert.Equal(t, pods, updater.getPodsUpdateOrder(pods, defaulted))
+
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, false)
+	immediate.Spec.UpdatePolicy.InRecommendationBoundsEvictionLifetimeThreshold = &metav1.Duration{Duration: 0}
+	assert.Empty(t, updater.getPodsUpdateOrder(pods, immediate), "override must be ignored when PerVPAConfig is disabled")
+}

@@ -37,6 +37,73 @@ const (
 	containerName = "container1"
 )
 
+func TestProfileLifetimeControlsEligibility(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		enabled     bool
+		lifetime    *metav1.Duration
+		age         time.Duration
+		diff        float64
+		outside     bool
+		missingTime bool
+		want        int
+	}{
+		{name: "zero overrides default", enabled: true, lifetime: &metav1.Duration{}, diff: 0.25, want: 1},
+		{name: "before boundary", enabled: true, lifetime: &metav1.Duration{Duration: 10 * time.Minute}, age: 10*time.Minute - time.Nanosecond, diff: 0.25},
+		{name: "at boundary", enabled: true, lifetime: &metav1.Duration{Duration: 10 * time.Minute}, age: 10 * time.Minute, diff: 0.25, want: 1},
+		{name: "absent uses global", enabled: true, age: *podLifetimeUpdateThreshold - time.Nanosecond, diff: 0.25},
+		{name: "absent at global boundary", enabled: true, age: *podLifetimeUpdateThreshold, diff: 0.25, want: 1},
+		{name: "disabled ignores zero", lifetime: &metav1.Duration{}, diff: 0.25},
+		{name: "disabled uses global boundary", lifetime: &metav1.Duration{Duration: 48 * time.Hour}, age: *podLifetimeUpdateThreshold, diff: 0.25, want: 1},
+		{name: "zero retains difference check", enabled: true, lifetime: &metav1.Duration{}, diff: 0.01},
+		{name: "zero retains start time check", enabled: true, lifetime: &metav1.Duration{}, diff: 0.25, missingTime: true},
+		{name: "outside range bypasses lifetime", enabled: true, lifetime: &metav1.Duration{Duration: 48 * time.Hour}, diff: 0.25, outside: true, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, tc.enabled)
+			pod := test.Pod().WithName("pod").AddContainer(test.Container().WithName(containerName).WithCPURequest(resource.MustParse("4")).Get()).Get()
+			now := pod.Status.StartTime.Add(tc.age)
+			if tc.missingTime {
+				pod.Status.StartTime = nil
+			}
+			vpa := test.VerticalPodAutoscaler().WithContainer(containerName).WithTarget("5", "").
+				WithLowerBound("1", "").WithUpperBound("6", "").Get()
+			threshold := 0.1
+			vpa.Spec.UpdatePolicy = &vpa_types.PodUpdatePolicy{
+				PodUpdateThreshold: &threshold, InRecommendationBoundsEvictionLifetimeThreshold: tc.lifetime,
+			}
+			calc := NewUpdatePriorityCalculator(vpa, nil, &test.FakeRecommendationProcessor{},
+				NewFakeProcessor(map[string]PodPriority{"pod": {ResourceDiff: tc.diff, OutsideRecommendedRange: tc.outside}}))
+			calc.AddPod(pod, now)
+			assert.Len(t, calc.GetSortedPods(NewDefaultPodEvictionAdmission()), tc.want)
+		})
+	}
+}
+
+func TestProfileLifetimesAreIndependentAndCanChange(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, true)
+	pod := test.Pod().WithName("pod").AddContainer(test.Container().WithName(containerName).WithCPURequest(resource.MustParse("4")).Get()).Get()
+	first := test.VerticalPodAutoscaler().WithContainer(containerName).WithTarget("5", "").
+		WithLowerBound("1", "").WithUpperBound("6", "").Get()
+	first.Spec.UpdatePolicy = &vpa_types.PodUpdatePolicy{InRecommendationBoundsEvictionLifetimeThreshold: &metav1.Duration{}}
+	second := first.DeepCopy()
+	second.Spec.UpdatePolicy.InRecommendationBoundsEvictionLifetimeThreshold.Duration = 10 * time.Minute
+	check := func(vpa *vpa_types.VerticalPodAutoscaler, want int) {
+		t.Helper()
+		calc := NewUpdatePriorityCalculator(vpa, nil, &test.FakeRecommendationProcessor{}, NewProcessor())
+		calc.AddPod(pod, pod.Status.StartTime.Add(5*time.Minute))
+		assert.Len(t, calc.GetSortedPods(NewDefaultPodEvictionAdmission()), want)
+	}
+	check(first, 1)
+	check(second, 0)
+	first.Spec.UpdatePolicy.InRecommendationBoundsEvictionLifetimeThreshold.Duration = time.Hour
+	check(first, 0)
+	check(second, 0)
+	second.Spec.UpdatePolicy.InRecommendationBoundsEvictionLifetimeThreshold.Duration = time.Minute
+	check(second, 1)
+	check(first, 0)
+}
+
 func TestUpdatePriorityCalculatorUsesPerVPAThreshold(t *testing.T) {
 	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.PerVPAConfig, true)
 	threshold := 0.45

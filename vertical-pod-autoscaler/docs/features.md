@@ -40,6 +40,7 @@ spec:
   updatePolicy:
     updateMode: Recreate
     podUpdateThreshold: 0.1
+    inRecommendationBoundsEvictionLifetimeThreshold: 0s
   resourcePolicy:
     containerPolicies:
       - containerName: "*"
@@ -57,6 +58,15 @@ It must be nonnegative; zero is supported. It changes the existing
 resource-difference threshold, not the updater's other eligibility rules, age
 checks, out-of-range handling, disruption budgets, or minimum replicas.
 Omitting the field retains the global setting.
+
+`inRecommendationBoundsEvictionLifetimeThreshold` overrides
+`--in-recommendation-bounds-eviction-lifetime-threshold` for the whole VPA.
+It is a non-negative duration specifying the minimum pod age for updates
+within the recommended range. `0s` removes that age wait, but the
+resource-difference threshold and other update/disruption checks still apply.
+Omitting the field retains the global flag, whose default remains 12 hours.
+Out-of-range and quick-OOM handling are unchanged. This field is also gated
+by `PerVPAConfig`; it does not change CPU histogram decay.
 
 When a half-life changes, existing bucket weights and reference timestamps are
 carried forward unchanged, as with restoring an existing VPA checkpoint under

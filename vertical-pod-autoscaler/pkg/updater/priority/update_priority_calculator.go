@@ -126,7 +126,7 @@ func (calc *UpdatePriorityCalculator) AddPod(pod *apiv1.Pod, now time.Time) {
 
 	// The update is allowed in following cases:
 	// - the request is outside the recommended range for some container.
-	// - the pod lives for at least 24h and the resource diff is >= MinChangePriority.
+	// - the pod reaches its lifetime threshold and the resource diff is >= MinChangePriority.
 	// - a vpa scaled container OOMed in less than evictAfterOOMThreshold.
 	if !updatePriority.OutsideRecommendedRange && !quickOOM {
 		if pod.Status.StartTime == nil {
@@ -134,7 +134,12 @@ func (calc *UpdatePriorityCalculator) AddPod(pod *apiv1.Pod, now time.Time) {
 			klog.V(4).InfoS("Not updating pod, missing field pod.Status.StartTime", "pod", klog.KObj(pod))
 			return
 		}
-		if now.Before(pod.Status.StartTime.Add(*podLifetimeUpdateThreshold)) {
+		lifetime := *podLifetimeUpdateThreshold
+		if features.Enabled(features.PerVPAConfig) && calc.vpa.Spec.UpdatePolicy != nil &&
+			calc.vpa.Spec.UpdatePolicy.InRecommendationBoundsEvictionLifetimeThreshold != nil {
+			lifetime = calc.vpa.Spec.UpdatePolicy.InRecommendationBoundsEvictionLifetimeThreshold.Duration
+		}
+		if now.Before(pod.Status.StartTime.Add(lifetime)) {
 			klog.V(4).InfoS("Not updating a short-lived pod, request within recommended range", "pod", klog.KObj(pod))
 			return
 		}

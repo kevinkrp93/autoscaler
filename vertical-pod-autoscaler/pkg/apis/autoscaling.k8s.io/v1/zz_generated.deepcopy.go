@@ -189,6 +189,11 @@ func (in *PodUpdatePolicy) DeepCopyInto(out *PodUpdatePolicy) {
 		*out = new(float64)
 		**out = **in
 	}
+	if in.InRecommendationBoundsEvictionLifetimeThreshold != nil {
+		in, out := &in.InRecommendationBoundsEvictionLifetimeThreshold, &out.InRecommendationBoundsEvictionLifetimeThreshold
+		*out = new(metav1.Duration)
+		**out = **in
+	}
 	return
 }
 

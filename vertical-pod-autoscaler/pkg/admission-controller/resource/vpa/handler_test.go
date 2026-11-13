@@ -46,10 +46,15 @@ func TestValidateProfileConfiguration(t *testing.T) {
 		enabled   bool
 		halfLife  *metav1.Duration
 		threshold *float64
+		lifetime  *metav1.Duration
 		errorText string
 	}{
 		{name: "valid", enabled: true, halfLife: &metav1.Duration{Duration: 5 * time.Minute}, threshold: ptr.To(0.1)},
 		{name: "zero threshold", enabled: true, threshold: ptr.To(0.0)},
+		{name: "zero lifetime", enabled: true, lifetime: &metav1.Duration{}},
+		{name: "positive lifetime", enabled: true, lifetime: &metav1.Duration{Duration: time.Hour}},
+		{name: "negative lifetime", enabled: true, lifetime: &metav1.Duration{Duration: -time.Second}, errorText: "inRecommendationBoundsEvictionLifetimeThreshold must"},
+		{name: "lifetime feature disabled", lifetime: &metav1.Duration{}, errorText: "PerVPAConfig is disabled"},
 		{name: "defaults with feature disabled"},
 		{name: "negative threshold", enabled: true, threshold: ptr.To(-0.1), errorText: "podUpdateThreshold must"},
 		{name: "zero half life", enabled: true, halfLife: &metav1.Duration{}, errorText: "cpuHistogramDecayHalfLife must"},
@@ -64,7 +69,7 @@ func TestValidateProfileConfiguration(t *testing.T) {
 			mode := vpa_types.UpdateModeOff
 			vpa := &vpa_types.VerticalPodAutoscaler{Spec: vpa_types.VerticalPodAutoscalerSpec{
 				TargetRef:    &autoscalingv1.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "example"},
-				UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode, PodUpdateThreshold: tc.threshold},
+				UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode, PodUpdateThreshold: tc.threshold, InRecommendationBoundsEvictionLifetimeThreshold: tc.lifetime},
 				ResourcePolicy: &vpa_types.PodResourcePolicy{ContainerPolicies: []vpa_types.ContainerResourcePolicy{
 					{ContainerName: "*", CPUHistogramDecayHalfLife: tc.halfLife},
 				}},

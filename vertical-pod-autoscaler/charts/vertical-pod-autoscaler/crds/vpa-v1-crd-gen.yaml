@@ -465,6 +465,14 @@ spec:
                       - resources
                       type: object
                     type: array
+                  inRecommendationBoundsEvictionLifetimeThreshold:
+                    description: |-
+                      InRecommendationBoundsEvictionLifetimeThreshold is the minimum pod age
+                      for updates within the recommended range. Overrides the updater's
+                      --in-recommendation-bounds-eviction-lifetime-threshold flag when
+                      PerVPAConfig is enabled. Omitted values use the global flag; zero disables
+                      only the age check. Other update and disruption checks still apply.
+                    type: string
                   minReplicas:
                     description: |-
                       Minimal number of replicas which need to be alive for Updater to attempt

@@ -131,6 +131,14 @@ func ValidateVPA(vpa *vpa_types.VerticalPodAutoscaler, isCreate bool) error {
 				return fmt.Errorf("podUpdateThreshold must be greater than or equal to 0, got %v", *threshold)
 			}
 		}
+		if lifetime := vpa.Spec.UpdatePolicy.InRecommendationBoundsEvictionLifetimeThreshold; lifetime != nil {
+			if !features.Enabled(features.PerVPAConfig) {
+				return fmt.Errorf("inRecommendationBoundsEvictionLifetimeThreshold is not supported when feature flag %s is disabled", features.PerVPAConfig)
+			}
+			if lifetime.Duration < 0 {
+				return fmt.Errorf("inRecommendationBoundsEvictionLifetimeThreshold must be greater than or equal to 0, got %s", lifetime.Duration)
+			}
+		}
 	}
 
 	if vpa.Spec.ResourcePolicy != nil {

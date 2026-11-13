@@ -162,6 +162,7 @@ _Appears in:_
 | `minReplicas` _integer_ | Minimal number of replicas which need to be alive for Updater to attempt<br />pod eviction (pending other checks like PDB). Only positive values are<br />allowed. Overrides global '--min-replicas' flag. |  | Optional: \{\} <br /> |
 | `evictionRequirements` _[EvictionRequirement](#evictionrequirement) array_ | EvictionRequirements is a list of EvictionRequirements that need to<br />evaluate to true in order for a Pod to be evicted. If more than one<br />EvictionRequirement is specified, all of them need to be fulfilled to allow eviction. |  | Optional: \{\} <br /> |
 | `podUpdateThreshold` _float_ | podUpdateThreshold is the minimum resource difference that triggers an<br />update for pods whose requests are within the recommended range. It<br />overrides the updater's --pod-update-threshold flag. |  | Minimum: 0 <br />Optional: \{\} <br /> |
+| `inRecommendationBoundsEvictionLifetimeThreshold` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#duration-v1-meta)_ | InRecommendationBoundsEvictionLifetimeThreshold is the minimum pod age<br />for updates within the recommended range. Overrides the updater's<br />--in-recommendation-bounds-eviction-lifetime-threshold flag when<br />PerVPAConfig is enabled. Omitted values use the global flag; zero disables<br />only the age check. Other update and disruption checks still apply. |  | Optional: \{\} <br /> |
 
 
 #### RecommendedContainerResources

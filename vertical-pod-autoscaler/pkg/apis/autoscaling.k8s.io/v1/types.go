@@ -156,6 +156,14 @@ type PodUpdatePolicy struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	PodUpdateThreshold *float64 `json:"podUpdateThreshold,omitempty" protobuf:"fixed64,4,opt,name=podUpdateThreshold"`
+
+	// InRecommendationBoundsEvictionLifetimeThreshold is the minimum pod age
+	// for updates within the recommended range. Overrides the updater's
+	// --in-recommendation-bounds-eviction-lifetime-threshold flag when
+	// PerVPAConfig is enabled. Omitted values use the global flag; zero disables
+	// only the age check. Other update and disruption checks still apply.
+	// +optional
+	InRecommendationBoundsEvictionLifetimeThreshold *metav1.Duration `json:"inRecommendationBoundsEvictionLifetimeThreshold,omitempty" protobuf:"bytes,5,opt,name=inRecommendationBoundsEvictionLifetimeThreshold"`
 }
 
 // UpdateMode controls when autoscaler applies changes to the pod resources.
